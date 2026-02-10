@@ -1,14 +1,251 @@
-from loguru import logger
+from __future__ import annotations
+
+from dataclasses import dataclass
+from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
+
+from binance.client import Client
+from loguru import logger
+
+from src.config import settings
+from src.storage import append_trade_row
+import time
+import requests
+from requests.exceptions import ConnectionError, ReadTimeout
+
+
 
 LOG_DIR = Path("logs")
 LOG_DIR.mkdir(exist_ok=True)
-
+TRADES_CSV = LOG_DIR / "trades.csv"
 logger.add(LOG_DIR / "bot.log", rotation="1 MB", retention="7 days")
 
+WANTED_ASSETS = {"USDT", "USDC", "BTC", "ETH", "BNB"}
+
+
+@dataclass(frozen=True)
+class SymbolFilters:
+    min_qty: Decimal
+    step_size: Decimal
+    min_notional: Decimal
+
+
+def make_client() -> Client:
+    if not settings.api_key or not settings.api_secret:
+        raise RuntimeError("Missing BINANCE_API_KEY or BINANCE_API_SECRET in .env")
+
+    client = Client(settings.api_key, settings.api_secret)
+    client.API_URL = settings.base_url + "/api"  # Spot Testnet
+    return client
+
+
+def get_selected_balances(client: Client) -> list[dict]:
+    account = client.get_account()
+    balances = []
+    for b in account.get("balances", []):
+        asset = b.get("asset", "")
+        if asset in WANTED_ASSETS:
+            free = float(b.get("free", 0))
+            locked = float(b.get("locked", 0))
+            balances.append({"asset": asset, "free": free, "locked": locked})
+    return balances
+
+
+def get_free_balance(balances: list[dict], asset: str) -> Decimal:
+    for b in balances:
+        if b["asset"] == asset:
+            return Decimal(str(b["free"]))
+    return Decimal("0")
+
+
+def _as_decimal(x: str | int | float) -> Decimal:
+    return Decimal(str(x))
+
+
+def _round_step(value: Decimal, step: Decimal) -> Decimal:
+    # round DOWN to the nearest step
+    if step == 0:
+        return value
+    steps = (value / step).to_integral_value(rounding=ROUND_DOWN)
+    return steps * step
+
+def _fmt_dec(x: Decimal, ndigits: int = 8) -> str:
+    q = Decimal("1").scaleb(-ndigits)  # 10^-ndigits
+    return str(x.quantize(q))
+
+def _pct(price: Decimal, entry: Decimal) -> Decimal:
+    """Percent change from entry to price."""
+    if entry == 0:
+        return Decimal("0")
+    return (price / entry - Decimal("1")) * Decimal("100")
+
+def _fmt_dec(x: Decimal, ndigits: int = 8) -> str:
+    q = Decimal("1").scaleb(-ndigits)  # 10^-ndigits
+    return str(x.quantize(q))
+
+def _pct(a: Decimal, b: Decimal) -> Decimal:
+    # (a/b - 1) * 100
+    if b == 0:
+        return Decimal("0")
+    return (a / b - Decimal("1")) * Decimal("100")
+
+
+def get_symbol_filters(client: Client, symbol: str) -> SymbolFilters:
+    info = client.get_symbol_info(symbol)
+    if not info:
+        raise RuntimeError(f"Symbol info not found for {symbol}")
+
+    lot = next(f for f in info["filters"] if f["filterType"] == "LOT_SIZE")
+    notional = next(f for f in info["filters"] if f["filterType"] in {"MIN_NOTIONAL", "NOTIONAL"})
+
+    min_qty = _as_decimal(lot["minQty"])
+    step_size = _as_decimal(lot["stepSize"])
+
+    # Some testnet environments use NOTIONAL filter with fields like minNotional / minNotionalValue
+    min_notional_val = notional.get("minNotional") or notional.get("minNotionalValue")
+    if min_notional_val is None:
+        # Fallback – if not present, assume 0 (rare)
+        min_notional = Decimal("0")
+    else:
+        min_notional = _as_decimal(min_notional_val)
+
+    return SymbolFilters(min_qty=min_qty, step_size=step_size, min_notional=min_notional)
+
+
 def main() -> None:
-    logger.info("Bot started")
-    logger.info("Environment OK ✅")
+    logger.info("Starting Binance testnet trade...")
+    logger.info(f"DRY_RUN={settings.dry_run}")
+
+    def make_client() -> Client:
+        Client.API_URL = settings.base_url + "/api"
+
+        # таймауты для requests внутри python-binance
+        client = None
+        for attempt in range(5):
+            try:
+                client = Client(
+                    settings.api_key,
+                    settings.api_secret,
+                    requests_params={"timeout": 10},
+                )
+                return client
+            except (ConnectionError, ReadTimeout) as e:
+                logger.warning(f"make_client attempt {attempt+1}/5 failed: {e}. retrying...")
+                time.sleep(1 + attempt)
+
+        raise RuntimeError("Failed to create Binance client after retries")
+
+    client = make_client()
+    logger.info(f"API_URL={client.API_URL}")
+
+    symbol = "BTCUSDT"
+    quote_asset = "USDT"
+    spend_quote = Decimal("10")  # spend 10 USDT to buy BTC
+
+    # Read price (for sanity/logs; market order will use orderbook)
+    ticker = client.get_symbol_ticker(symbol=symbol)
+    price = _as_decimal(ticker["price"])
+    logger.info(f"{symbol} price: {price}")
+
+    # Filters (for sell rounding & minNotional sanity)
+    filters = get_symbol_filters(client, symbol)
+    logger.info(f"{symbol} filters: minQty={filters.min_qty}, stepSize={filters.step_size}, minNotional={filters.min_notional}")
+
+    balances = get_selected_balances(client)
+    free_quote = get_free_balance(balances, quote_asset)
+    logger.info(f"Balances (selected): {balances}")
+    logger.info(f"Trade plan: MARKET BUY {symbol} spending {spend_quote} {quote_asset}")
+
+    if free_quote < spend_quote:
+        logger.warning(f"Not enough {quote_asset}: have {free_quote}, need {spend_quote}. Skipping.")
+        return
+
+    # Basic minNotional sanity (market will satisfy if spend_quote >= minNotional)
+    if spend_quote < filters.min_notional:
+        logger.warning(f"Spend {spend_quote} is below minNotional {filters.min_notional}. Increase spend_quote.")
+        return
+
+    if settings.dry_run:
+        est_qty_btc = spend_quote / price
+        logger.info(f"Estimated BTC qty (before filters): ~{est_qty_btc:.8f} BTC")
+        logger.info("DRY RUN: order not sent ✅")
+        return
+
+    # 1) MARKET BUY using quoteOrderQty (spend exact USDT amount)
+    buy_order = client.create_order(
+        symbol=symbol,
+        side=Client.SIDE_BUY,
+        type=Client.ORDER_TYPE_MARKET,
+        quoteOrderQty=str(spend_quote),
+    )
+    logger.info(f"BUY order response: {buy_order}")
+
+    # Refresh balances to know exact BTC received
+    balances_after_buy = get_selected_balances(client)
+    btc_free = get_free_balance(balances_after_buy, "BTC")
+    logger.info(f"Balances after BUY: {balances_after_buy}")
+    logger.info(f"BTC free after BUY: {btc_free}")
+
+    # 2) MARKET SELL the purchased BTC (rounded DOWN to stepSize)
+    # We sell ONLY what we bought in this cycle
+    bought_qty = _as_decimal(buy_order["executedQty"])
+    sell_qty = _round_step(bought_qty, filters.step_size)
+
+    logger.info(f"Bought qty: {bought_qty} -> Sell qty (rounded): {sell_qty}")
+
+    # Safety stop (must be AFTER sell_qty is computed)
+    if sell_qty > Decimal("0.01"):
+        raise RuntimeError(f"Safety stop: sell_qty too large: {sell_qty}")
+
+    if sell_qty < filters.min_qty:
+        logger.warning(f"Sell qty {sell_qty} is below minQty {filters.min_qty}. Not selling.")
+        return
+
+    approx_notional = sell_qty * price
+    if approx_notional < filters.min_notional:
+        logger.warning(f"Approx sell notional {approx_notional} < minNotional {filters.min_notional}. Not selling.")
+        return
+
+    sell_order = client.create_order(
+        symbol=symbol,
+        side=Client.SIDE_SELL,
+        type=Client.ORDER_TYPE_MARKET,
+        quantity=str(sell_qty),
+    )
+    logger.info(f"SELL order response: {sell_order}")
+
+    append_trade_row(TRADES_CSV, {
+        "ts_ms": int(time.time() * 1000),
+        "symbol": symbol,
+        "buy_order_id": buy_order.get("orderId"),
+        "sell_order_id": sell_order.get("orderId"),
+        "buy_qty_btc": str(buy_qty),
+        "buy_quote_usdt": str(buy_quote),
+        "sell_qty_btc": str(sell_qty_exe),
+        "sell_quote_usdt": str(sell_quote),
+        "pnl_usdt": str(pnl),
+    })
+    logger.info(f"Saved trade to {TRADES_CSV}")
+
+    balances_after_sell = get_selected_balances(client)
+    logger.info(f"Balances after SELL: {balances_after_sell}")
+
+
+    buy_qty = _as_decimal(buy_order["executedQty"])
+    sell_qty_exe = _as_decimal(sell_order["executedQty"])
+
+    buy_quote = _as_decimal(buy_order["cummulativeQuoteQty"])
+    sell_quote = _as_decimal(sell_order["cummulativeQuoteQty"])
+
+    pnl = sell_quote - buy_quote
+
+    logger.info(
+        f"Cycle result: buy_qty={buy_qty} BTC, buy_quote={buy_quote} USDT | "
+        f"sell_qty={sell_qty_exe} BTC, sell_quote={sell_quote} USDT | PnL={pnl} USDT"
+    )
+
+ 
+
 
 if __name__ == "__main__":
     main()

@@ -1,0 +1,16 @@
+python-dotenv could not parse statement starting at line 4
+2026-02-10 04:37:13.142 | WARNING  | src.runner:<lambda>:75 - make_data_client retry #1: ReadTimeout: HTTPSConnectionPool(host='api.binance.com', port=443): Read timed out. (read timeout=10) (sleep 0.48s)
+2026-02-10 04:37:23.751 | WARNING  | src.runner:<lambda>:75 - make_data_client retry #2: ReadTimeout: HTTPSConnectionPool(host='api.binance.com', port=443): Read timed out. (read timeout=10) (sleep 0.85s)
+2026-02-10 04:37:28.683 | INFO     | __main__:main:590 - Saved candles to data/ETHUSDT_15m_2026-01-01_2026-02-06.csv
+2026-02-10 04:37:28.684 | INFO     | __main__:main:618 - CFG CHECK | breakout_lookback=20 breakout_min_delta_pct=0.0015
+2026-02-10 04:37:28.684 | INFO     | __main__:main:619 - CFG CHECK | use_atr_exits=True sl_atr_mult=1.0 tp_atr_mult=2.0 tp_pct=0.002 sl_pct=0.002
+2026-02-10 04:37:28.684 | INFO     | __main__:main:623 - CFG CHECK | adx_period=14 adx_min=25.0 adx_rising=False
+2026-02-10 04:37:39.610 | WARNING  | src.runner:<lambda>:97 - make_client retry #1: ReadTimeout: HTTPSConnectionPool(host='testnet.binance.vision', port=443): Read timed out. (read timeout=10) (sleep 0.36s)
+2026-02-10 04:37:50.726 | WARNING  | src.runner:<lambda>:97 - make_client retry #2: ReadTimeout: HTTPSConnectionPool(host='testnet.binance.vision', port=443): Read timed out. (read timeout=10) (sleep 0.82s)
+2026-02-10 04:37:54.035 | INFO     | __main__:backtest_csv:268 - PARTIAL@CLOSE | bar=1122 ts=None close=3143.22000000 entry=3127.52000000 atr=14.79127039461146325145597743 be_trigger=3142.311270394611463251455977 qty_part=0.00070000 qty_left=0.00240000 be_stop=3139.697809459145886601883692
+2026-02-10 04:37:54.084 | INFO     | __main__:backtest_csv:481 - DIAG | bars=3553 trend_ok=1462 bounce_up=1397 breakout_ok=342 atr_ok=3207 adx_ok=1725 price_above_slow=1670 slow_rising=1669 trend&slow_rising=1019 trend&above_slow=1019 entry_ok=51 in_pos_bars=112 avg_trade_bars=4.00
+2026-02-10 04:37:54.084 | INFO     | __main__:backtest_csv:490 - DIAG2 | sig_buy=28 sig_sell=28 buy_skips={'min_notional': 0, 'qty_lt_min': 0}
+2026-02-10 04:37:54.084 | INFO     | __main__:backtest_csv:504 - DIAG3 | be: n=1 pnl=0.014185419959248177716676340 avg_pnl=0.014185419959248177716676340 avg_bars=5.00 | sl: n=22 pnl=-1.028870750096582854849566693 avg_pnl=-0.04676685227711740249316212241 avg_bars=3.59 | tp: n=5 pnl=0.307168786613307452995292734 avg_pnl=0.0614337573226614905990585468 avg_bars=5.60
+2026-02-10 04:37:54.085 | INFO     | __main__:main:640 - BACKTEST | symbol=ETHUSDT interval=15m start=2026-01-01 end=2026-02-06 | EMA20/50/200 tol=0.001 bounce_min=0.0 brk_lb=20 brk_min=0.0015 tp=0.002 sl=0.002 atr_p=14 atr_min=0.0015 spend=10 taker_fee=0.001 maker_fee=0.0006 tp_as_maker=True close_on_end=True
+2026-02-10 04:37:54.085 | INFO     | __main__:main:653 - RESULT | trades=28 wins=6 losses=22 winrate=21.43% pnl_total=-0.707516543524027224137597619 max_dd=0.707516543524027224137597619 pf=0.3123368086247852318285698680 avg_win=0.053559034428759271785328179 avg_loss=0.04676685227711740249316212241 expectancy=-0.02526844798300097229062848639 avg_trade_bars=4.00 open_position=False
+2026-02-10 04:37:54.085 | INFO     | __main__:main:670 - REASONS | {'sl': 22, 'tp': 5, 'be': 1}

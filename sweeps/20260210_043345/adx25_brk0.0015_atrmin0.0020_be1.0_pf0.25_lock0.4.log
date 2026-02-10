@@ -1,0 +1,13 @@
+python-dotenv could not parse statement starting at line 4
+2026-02-10 04:37:57.588 | INFO     | __main__:main:590 - Saved candles to data/ETHUSDT_15m_2026-01-01_2026-02-06.csv
+2026-02-10 04:37:57.589 | INFO     | __main__:main:618 - CFG CHECK | breakout_lookback=20 breakout_min_delta_pct=0.0015
+2026-02-10 04:37:57.589 | INFO     | __main__:main:619 - CFG CHECK | use_atr_exits=True sl_atr_mult=1.0 tp_atr_mult=2.0 tp_pct=0.002 sl_pct=0.002
+2026-02-10 04:37:57.589 | INFO     | __main__:main:623 - CFG CHECK | adx_period=14 adx_min=25.0 adx_rising=False
+2026-02-10 04:38:08.377 | WARNING  | src.runner:<lambda>:97 - make_client retry #1: ReadTimeout: HTTPSConnectionPool(host='testnet.binance.vision', port=443): Read timed out. (read timeout=10) (sleep 0.46s)
+2026-02-10 04:38:10.915 | INFO     | __main__:backtest_csv:268 - PARTIAL@CLOSE | bar=1122 ts=None close=3143.22000000 entry=3127.52000000 atr=14.79157789714080341634893616 be_trigger=3142.311577897140803416348936 qty_part=0.00070000 qty_left=0.00240000 be_stop=3139.697932460157622667840875
+2026-02-10 04:38:10.963 | INFO     | __main__:backtest_csv:481 - DIAG | bars=3553 trend_ok=1462 bounce_up=1400 breakout_ok=340 atr_ok=3031 adx_ok=1723 price_above_slow=1670 slow_rising=1669 trend&slow_rising=1019 trend&above_slow=1019 entry_ok=44 in_pos_bars=101 avg_trade_bars=4.21
+2026-02-10 04:38:10.963 | INFO     | __main__:backtest_csv:490 - DIAG2 | sig_buy=24 sig_sell=24 buy_skips={'min_notional': 0, 'qty_lt_min': 0}
+2026-02-10 04:38:10.963 | INFO     | __main__:backtest_csv:504 - DIAG3 | be: n=1 pnl=0.014185714866473916108415282 avg_pnl=0.014185714866473916108415282 avg_bars=5.00 | sl: n=18 pnl=-0.889210100536303037099437094 avg_pnl=-0.04940056114090572428330206078 avg_bars=3.78 | tp: n=5 pnl=0.307386929932733690811344424 avg_pnl=0.0614773859865467381622688848 avg_bars=5.60
+2026-02-10 04:38:10.964 | INFO     | __main__:main:640 - BACKTEST | symbol=ETHUSDT interval=15m start=2026-01-01 end=2026-02-06 | EMA20/50/200 tol=0.001 bounce_min=0.0 brk_lb=20 brk_min=0.0015 tp=0.002 sl=0.002 atr_p=14 atr_min=0.0020 spend=10 taker_fee=0.001 maker_fee=0.0006 tp_as_maker=True close_on_end=True
+2026-02-10 04:38:10.964 | INFO     | __main__:main:653 - RESULT | trades=24 wins=6 losses=18 winrate=25.00% pnl_total=-0.567637455737095430179677388 max_dd=0.567637455737095430179677388 pf=0.3616385425730766645651062787 avg_win=0.05359544079986793448662661767 avg_loss=0.04940056114090572428330206078 expectancy=-0.02365156065571230959081989117 avg_trade_bars=4.21 open_position=False
+2026-02-10 04:38:10.964 | INFO     | __main__:main:670 - REASONS | {'sl': 18, 'tp': 5, 'be': 1}

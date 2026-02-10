@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ... (остальной код свипа без изменений) ...
+
+echo
+echo "DONE ✅"
+echo "Summary: $SUMMARY"
+echo "Logs dir: $OUTDIR"
+echo
+echo "Top by pnl_total:"
+python - "$SUMMARY" <<'PY'
+import csv, re, sys
+from decimal import Decimal
+from pathlib import Path
+
+summary_path = Path(sys.argv[1])
+rows = []
+
+with summary_path.open(newline="") as f:
+    reader = csv.DictReader(f, delimiter="\t")
+    for r in reader:
+        line = r.get("result_line", "")
+        m = re.search(r"pnl_total=([^\s|]+)", line)
+        pnl = Decimal(m.group(1)) if m else Decimal("0")
+        rows.append((pnl, r, line))
+
+rows.sort(key=lambda x: x[0], reverse=True)
+
+def grab(line: str, key: str) -> str:
+    m = re.search(rf"{re.escape(key)}=([^\s|]+)", line)
+    return m.group(1) if m else ""
+
+print("pnl_total\tbe_trigger_mult\tpartial_frac\tlock_atr_mult\ttrades\twinrate\tmax_dd\tpf")
+for pnl, r, line in rows[:15]:
+    print(
+        f"{pnl}\t{r.get('be_trigger_mult','')}\t{r.get('partial_frac','')}\t{r.get('lock_atr_mult','')}\t"
+        f"{grab(line,'trades')}\t{grab(line,'winrate')}\t{grab(line,'max_dd')}\t{grab(line,'pf')}"
+    )
+PY
+
+# Also write a full sorted TSV next to summary.tsv
+python - "$SUMMARY" <<'PY'
+import csv, re, sys
+from decimal import Decimal
+from pathlib import Path
+
+summary_path = Path(sys.argv[1])
+out_path = summary_path.with_name("summary_sorted.tsv")
+rows = []
+
+with summary_path.open(newline="") as f:
+    reader = csv.DictReader(f, delimiter="\t")
+    for r in reader:
+        line = r.get("result_line", "")
+        m = re.search(r"pnl_total=([^\s|]+)", line)
+        pnl = Decimal(m.group(1)) if m else Decimal("0")
+        rows.append((pnl, r))
+
+rows.sort(key=lambda x: x[0], reverse=True)
+
+if rows:
+    fieldnames = list(rows[0][1].keys())
+    with out_path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames, delimiter="\t")
+        w.writeheader()
+        for _, r in rows:
+            w.writerow(r)
+
+print(f"Sorted summary written: {out_path}")
+PY

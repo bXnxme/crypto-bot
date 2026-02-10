@@ -1,0 +1,54 @@
+diff --git a/src/backtest.py b/src/backtest.py
+index 0000000..1111111 100644
+--- a/src/backtest.py
++++ b/src/backtest.py
+@@ -151,15 +151,27 @@ def backtest_csv(
+                     else:
+                         # B) if BE already active from PREVIOUS candles -> check BE-stop intrabar
+                         if getattr(state, "be_active", False):
+-                            if state.stop_price is None:
+-                                be_price = entry * (Decimal("1") + taker_fee_rate) / (Decimal("1") - taker_fee_rate)
+-                                state.stop_price = be_price + atr * _d("0.20")
+-
+-                            if low <= state.stop_price:
+-                                forced_exit_price = state.stop_price
+-                                forced_reason = "be"
+-                                action = "SELL"
++                            # fee-aware break-even base
++                            be_price = entry * (Decimal("1") + taker_fee_rate) / (Decimal("1") - taker_fee_rate)
++
++                            # ATR trailing offset
++                            lock_mult = _d(cfg.lock_atr_mult)
++                            trail_offset = atr * lock_mult
++
++                            # candidate stop
++                            new_stop = be_price + trail_offset
++
++                            # init or trail only upwards
++                            if state.stop_price is None:
++                                state.stop_price = new_stop
++                            else:
++                                state.stop_price = max(state.stop_price, new_stop)
++
++                            if low <= state.stop_price:
++                                forced_exit_price = state.stop_price
++                                forced_reason = "be"
++                                action = "SELL"
+
+@@ -215,9 +227,9 @@ def backtest_csv(
+             # params (later move to cfg)
+-            partial_frac = Decimal(str(cfg.partial_frac))    # 33% фиксируем раньше/чаще
+-            be_trigger_mult = Decimal(str(cfg.be_trigger_mult))       # триггер на +1 ATR (раньше)
+-            lock_atr_mult = Decimal(str(cfg.lock_atr_mult))             # запас над fee-BE
++            partial_frac = Decimal(str(cfg.partial_frac))
++            be_trigger_mult = Decimal(str(cfg.be_trigger_mult))
++            lock_atr_mult = Decimal(str(cfg.lock_atr_mult))
+
+@@ -262,7 +274,7 @@ def backtest_csv(
+                     logger.info(
+-                        "PARTIAL@CLOSE | bar={} ts={} close={} entry={} atr={} be_trigger={} qty_part={} qty_left={} be_stop={}",
++                        "PARTIAL@CLOSE | bar={} ts={} close={} entry={} atr={} be_trigger={} qty_part={} qty_left={} be_stop={} lock_atr_mult={}",
+                         bar_i, ts, close, entry, atr, be_trigger,
+-                        qty_part, state.qty, state.stop_price
++                        qty_part, state.qty, state.stop_price, cfg.lock_atr_mult
+                     )
