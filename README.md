@@ -1,10 +1,10 @@
 # Crypto Bot: Demo Grid Runner
 
 Буду рад, если для Вас данное решение окажется полезным и также буду рад любым пожертвованиям голодающему поволжью - 
-USDT ERC20 - 0x1647B1773578AbBa725b2405B7c8Ad76de550F19
-USDT SOL - 6yqkL3nVcxJQ2Ekd6g8M4hG4qaRBKf6ZU8j3oWWYL6uX
-USDT TON - UQBktYrKNpWFQhg2vPPLl5ky_5CPe7DOIrGvHkegM6TKqgQR
-USDT TRC20 - TN8vagbvvWDDxaAiwqGfCB49RTV6aGtqyp
+- USDT ERC20 - 0x1647B1773578AbBa725b2405B7c8Ad76de550F19
+- USDT SOL - 6yqkL3nVcxJQ2Ekd6g8M4hG4qaRBKf6ZU8j3oWWYL6uX
+- USDT TON - UQBktYrKNpWFQhg2vPPLl5ky_5CPe7DOIrGvHkegM6TKqgQR
+- USDT TRC20 - TN8vagbvvWDDxaAiwqGfCB49RTV6aGtqyp
 
 ## Что это
 Проект для торговли в Binance Demo/Testnet режиме с сеточной стратегией.
