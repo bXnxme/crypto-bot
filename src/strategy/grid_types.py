@@ -35,7 +35,7 @@ class GridConfig:
     sell_only_above_cost: bool = False
     min_sell_markup_pct: Decimal = Decimal("0")
 
-    # Reanchor behavior (15m bar-close driven in adapter, config lives here)
+    # Reanchor behavior (bar-close driven in adapter, config lives here)
     reanchor_up: bool = False
     reanchor_down: bool = False
     reanchor_trigger_steps: int = 1

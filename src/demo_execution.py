@@ -100,6 +100,45 @@ def _pick_api_creds(base_url: str) -> tuple[str, str, str]:
     )
 
 
+def _split_symbol_guess(symbol: str) -> tuple[str, str]:
+    """Best-effort base/quote split before exchangeInfo is available."""
+    s = (symbol or "").strip().upper()
+    if not s:
+        return "", ""
+
+    # Longest suffixes first to avoid false matches (e.g. FDUSD before USD* family).
+    common_quote_assets = (
+        "FDUSD",
+        "USDT",
+        "USDC",
+        "USDP",
+        "TUSD",
+        "BUSD",
+        "BIDR",
+        "IDRT",
+        "DAI",
+        "BTC",
+        "ETH",
+        "BNB",
+        "TRY",
+        "EUR",
+        "BRL",
+        "GBP",
+        "AUD",
+        "RUB",
+        "UAH",
+        "JPY",
+    )
+    for quote in common_quote_assets:
+        if s.endswith(quote) and len(s) > len(quote):
+            return s[: -len(quote)], quote
+
+    # Fallback: keep previous heuristic.
+    if len(s) > 4:
+        return s[:-4], s[-4:]
+    return s, ""
+
+
 
 @dataclass
 class DemoFill:
@@ -183,9 +222,10 @@ class BinanceDemoExecution:
             else "CUSTOM"
         )
 
-        # Simple symbol parsing (works for ETHUSDT/BTCUSDT etc.)
-        self.quote_asset = "USDT" if self.symbol.endswith("USDT") else self.symbol[-4:]
-        self.base_asset = self.symbol[: -len(self.quote_asset)] if self.quote_asset else self.symbol
+        # Best-effort split; authoritative base/quote is loaded from exchangeInfo on bootstrap.
+        base_guess, quote_guess = _split_symbol_guess(self.symbol)
+        self.base_asset = base_guess or self.symbol
+        self.quote_asset = quote_guess or "USDT"
 
         self.client: Any = None
 
@@ -274,9 +314,9 @@ class BinanceDemoExecution:
                 cred_source,
             )
 
+            await self._load_symbol_filters()
             await self.refresh_balances()
             await self.refresh_open_orders()
-            await self._load_symbol_filters()
 
             logger.info(
                 "BinanceDemoExecution bootstrapped | symbol={} mode={} quote_balance={} base_balance={}",
@@ -442,6 +482,12 @@ class BinanceDemoExecution:
                 )
                 return
 
+            base_asset = str(info.get("baseAsset", "")).strip().upper()
+            quote_asset = str(info.get("quoteAsset", "")).strip().upper()
+            if base_asset and quote_asset:
+                self.base_asset = base_asset
+                self.quote_asset = quote_asset
+
             filters = info.get("filters", []) or []
             for f in filters:
                 if not isinstance(f, dict):
@@ -470,8 +516,10 @@ class BinanceDemoExecution:
                         self._min_notional = self._d(mn, str(self._min_notional))
 
             logger.info(
-                "BinanceDemoExecution symbol filters | symbol={} tick_size={} step_size={} min_qty={} min_notional={}",
+                "BinanceDemoExecution symbol filters | symbol={} base={} quote={} tick_size={} step_size={} min_qty={} min_notional={}",
                 self.symbol,
+                self.base_asset,
+                self.quote_asset,
                 self._price_tick_size,
                 self._qty_step_size,
                 self._min_qty,

@@ -7,6 +7,7 @@ import importlib
 import inspect
 import os
 import json
+import re
 import sys
 from pathlib import Path
 from dataclasses import dataclass
@@ -115,25 +116,75 @@ class BBO:
         return (self.bid + self.ask) / Decimal("2")
 
 
-class Candle15mBuilder:
-    """Builds closed 15m candles from mid-price ticks.
+_INTERVAL_RE = re.compile(r"^(\d+)([smhdwM])$")
+
+
+def _parse_interval(interval: str) -> tuple[int, str]:
+    raw = str(interval or "").strip()
+    m = _INTERVAL_RE.match(raw)
+    if m is None:
+        raise ValueError(
+            f"Invalid interval {interval!r}. Expected Binance format like 1m/5m/15m/1h/4h/1d/1w."
+        )
+    qty = int(m.group(1))
+    unit = m.group(2)
+    if qty <= 0:
+        raise ValueError(f"Interval quantity must be > 0, got {interval!r}")
+    return qty, unit
+
+
+def _normalize_interval(interval: str) -> str:
+    qty, unit = _parse_interval(interval)
+    return f"{qty}{unit}"
+
+
+def _floor_to_interval(ts: datetime, interval: str) -> datetime:
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    ts = ts.astimezone(timezone.utc)
+
+    qty, unit = _parse_interval(interval)
+    if unit == "M":
+        bucket_month = ((ts.month - 1) // qty) * qty + 1
+        return ts.replace(month=bucket_month, day=1, hour=0, minute=0, second=0, microsecond=0)
+    if unit == "w":
+        anchor = datetime(1970, 1, 5, tzinfo=timezone.utc)  # Monday 00:00 UTC
+        span = timedelta(weeks=qty)
+        span_seconds = int(span.total_seconds())
+        elapsed = int((ts - anchor).total_seconds())
+        buckets = elapsed // span_seconds
+        return anchor + timedelta(seconds=(buckets * span_seconds))
+
+    unit_seconds = {
+        "s": 1,
+        "m": 60,
+        "h": 3600,
+        "d": 86400,
+    }.get(unit)
+    if unit_seconds is None:
+        raise ValueError(f"Unsupported interval unit in {interval!r}")
+    span_seconds = qty * unit_seconds
+    bucket_epoch = (int(ts.timestamp()) // span_seconds) * span_seconds
+    return datetime.fromtimestamp(bucket_epoch, tz=timezone.utc)
+
+
+class CandleIntervalBuilder:
+    """Builds closed interval candles from mid-price ticks.
 
     Uses mid as O/H/L/C and synthetic volume=0. This is fine for grid logic that
     only needs bar-close cadence, and can later be replaced by real klines.
     """
 
-    def __init__(self):
+    def __init__(self, interval: str = "15m"):
+        self.interval = _normalize_interval(interval)
         self._bucket_start: Optional[datetime] = None
         self._o: Optional[Decimal] = None
         self._h: Optional[Decimal] = None
         self._l: Optional[Decimal] = None
         self._c: Optional[Decimal] = None
 
-    @staticmethod
-    def _bucket(ts: datetime) -> datetime:
-        ts = ts.astimezone(timezone.utc)
-        minute = (ts.minute // 15) * 15
-        return ts.replace(minute=minute, second=0, microsecond=0)
+    def _bucket(self, ts: datetime) -> datetime:
+        return _floor_to_interval(ts, self.interval)
 
     def on_bbo(self, bbo: BBO) -> Optional[dict[str, Any]]:
         px = bbo.mid
@@ -166,6 +217,10 @@ class Candle15mBuilder:
         self._bucket_start = bucket
         self._o = self._h = self._l = self._c = px
         return closed
+
+
+# Backward-compatible alias for local references/log wording.
+Candle15mBuilder = CandleIntervalBuilder
 
 
 async def _maybe_await(x: Any) -> Any:
@@ -749,13 +804,14 @@ def _emit_preflight_log(*, symbol: str, strategy: Any, execution: Any, state_fil
     b = _get_base_balance_total(execution)
     oo = getattr(execution, "open_orders", None)
     strategy_name = type(strategy).__name__ if strategy is not None else "None"
+    strategy_interval = getattr(strategy, "interval", None)
     raw_adapter_fields = _safe_strategy_fields(strategy, execution=execution)
     adapter_quote_view = raw_adapter_fields.get("quote") if isinstance(raw_adapter_fields, dict) else None
     adapter_base_view = raw_adapter_fields.get("base") if isinstance(raw_adapter_fields, dict) else None
     adapter_preview = _compact_adapter_preview(raw_adapter_fields)
     logger.info(
         "PREFLIGHT mode=demo_live_grid symbol={} state_file={} state_loaded={} | strategy={} | quote_balance={} base_balance={} open_orders={} | "
-        "demo_rest={} demo_ws={} | adapter_quote_view={} adapter_base_view={} | adapter_preview={}",
+        "strategy_interval={} | demo_rest={} demo_ws={} | adapter_quote_view={} adapter_base_view={} | adapter_preview={}",
         symbol,
         (str(state_file) if state_file is not None else "-"),
         state_loaded,
@@ -763,6 +819,7 @@ def _emit_preflight_log(*, symbol: str, strategy: Any, execution: Any, state_fil
         _fmt_num(q) if q is not None else "?",
         _fmt_num(b) if b is not None else "?",
         len(oo) if isinstance(oo, list) else oo,
+        strategy_interval or "?",
         os.environ.get("BINANCE_DEMO_REST_BASE_URL", "-"),
         os.environ.get("BINANCE_DEMO_WS_BASE_URL", "-"),
         (_fmt_num(adapter_quote_view) if adapter_quote_view is not None else "?"),
@@ -771,9 +828,10 @@ def _emit_preflight_log(*, symbol: str, strategy: Any, execution: Any, state_fil
     )
 
 
-async def run_loop(*, symbol: str, strategy: Any, max_ticks: int = 0) -> None:
+async def run_loop(*, symbol: str, strategy: Any, interval: str = "15m", max_ticks: int = 0) -> None:
     if stream_book_ticker is None:
         raise RuntimeError(f"Cannot import stream_book_ticker: {_IMPORT_WS_ERR}")
+    interval = _normalize_interval(interval)
 
     # Force demo endpoints for this runner.
     # IMPORTANT: REST must be https://demo-api.binance.com, while WS is wss://demo-stream.binance.com.
@@ -920,19 +978,29 @@ async def run_loop(*, symbol: str, strategy: Any, max_ticks: int = 0) -> None:
         except Exception:
             pass
 
-    candle_builder = Candle15mBuilder()
+    candle_builder = CandleIntervalBuilder(interval=interval)
     paper_adapter = None
     GridPaperAdapterCls, grid_adapter_import_err = _resolve_grid_paper_adapter_class()
     if GridPaperAdapterCls is not None:
         try:
-            paper_adapter = GridPaperAdapterCls(symbol=symbol)
-            logger.info("Using GridPaperAdapter for synthetic 15m candles")
+            paper_adapter = GridPaperAdapterCls(symbol=symbol, interval=interval)
+            logger.info("Using GridPaperAdapter for synthetic {} candles", interval)
+        except TypeError:
+            # Older adapter signatures may not accept `interval`.
+            if interval == "15m":
+                paper_adapter = GridPaperAdapterCls(symbol=symbol)
+                logger.info("Using GridPaperAdapter for synthetic {} candles", interval)
+            else:
+                logger.warning(
+                    "GridPaperAdapter doesn't accept interval={} in constructor; using fallback bar builder",
+                    interval,
+                )
         except Exception as e:
-            logger.warning("GridPaperAdapter init failed, fallback to Candle15mBuilder: {}", e)
+            logger.warning("GridPaperAdapter init failed, fallback to CandleIntervalBuilder: {}", e)
     else:
         if grid_adapter_import_err:
             logger.info(
-                "GridPaperAdapter import unavailable, using Candle15mBuilder fallback: {}",
+                "GridPaperAdapter import unavailable, using CandleIntervalBuilder fallback: {}",
                 grid_adapter_import_err,
             )
     runtime_stats: dict[str, Any] = {
@@ -1002,7 +1070,12 @@ async def run_loop(*, symbol: str, strategy: Any, max_ticks: int = 0) -> None:
     )
 
     tick_count = 0
-    logger.info("START demo grid runner | symbol={} max_ticks={}", symbol, max_ticks or "∞")
+    logger.info(
+        "START demo grid runner | symbol={} interval={} max_ticks={}",
+        symbol,
+        interval,
+        max_ticks or "∞",
+    )
 
     if state_flush_sec > 0:
         state_task = asyncio.create_task(
@@ -1359,7 +1432,7 @@ async def run_loop(*, symbol: str, strategy: Any, max_ticks: int = 0) -> None:
                         log_local_cancel_events,
                     )
 
-            # 3) build synthetic 15m bars from mid and emit on close
+            # 3) build synthetic bars from mid and emit on close for selected interval
             closed_bar = None
             if paper_adapter is not None:
                 try:
@@ -1378,7 +1451,9 @@ async def run_loop(*, symbol: str, strategy: Any, max_ticks: int = 0) -> None:
                     logger.warning("GridPaperAdapter on_quote failed, fallback builder: {}", e)
                     paper_adapter = None
 
-            if closed_bar is None:
+            # Use fallback builder only when GridPaperAdapter is unavailable.
+            # Otherwise it will mirror the same ticks and can emit duplicate bar closes.
+            if paper_adapter is None and closed_bar is None:
                 closed_bar = candle_builder.on_bbo(BBO(ts=now_utc, bid=bid, ask=ask))
 
             if closed_bar is not None:
@@ -1779,8 +1854,9 @@ class NoopStrategy:
         logger.info("BAR -> strategy stub received close={} ts={}", bar.get("close"), bar.get("ts"))
 
 
-def build_strategy() -> Any:
-    symbol = os.getenv("SYMBOL", "ETHUSDT").strip().upper() or "ETHUSDT"
+def build_strategy(symbol: str, interval: str = "15m") -> Any:
+    symbol = (symbol or "ETHUSDT").strip().upper() or "ETHUSDT"
+    interval = _normalize_interval(interval)
 
     candidates: list[tuple[str, str]] = [
         ("src.paper.execution_bridge", "BacktestAdapter"),
@@ -1790,8 +1866,11 @@ def build_strategy() -> Any:
     ]
 
     ctor_variants: tuple[dict[str, Any], ...] = (
+        {"symbol": symbol, "interval": interval},
         {"symbol": symbol},
+        {"execution": None, "symbol": symbol, "interval": interval},
         {"execution": None},
+        {"executor": None, "symbol": symbol, "interval": interval},
         {"executor": None},
         {},
     )
@@ -1851,6 +1930,11 @@ def _configure_terminal_logger(level: str) -> None:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run live demo grid loop on Binance testnet bookTicker")
     p.add_argument("--symbol", default="ETHUSDT")
+    p.add_argument(
+        "--interval",
+        default=os.getenv("RUN_DEMO_GRID_INTERVAL", "15m"),
+        help="Synthetic candle interval (e.g. 1m, 5m, 15m, 1h, 4h, 1d, 1w)",
+    )
     p.add_argument("--max-ticks", type=int, default=0, help="0 = infinite")
     p.add_argument("--log-level", default="INFO")
     return p.parse_args()
@@ -1860,9 +1944,16 @@ async def amain() -> int:
     args = parse_args()
     _configure_terminal_logger(args.log_level)
 
-    strategy = build_strategy()
+    symbol = (args.symbol or "ETHUSDT").strip().upper()
     try:
-        await run_loop(symbol=args.symbol.upper(), strategy=strategy, max_ticks=args.max_ticks)
+        interval = _normalize_interval(args.interval)
+    except ValueError as e:
+        logger.error("Invalid --interval value: {}", e)
+        return 2
+
+    strategy = build_strategy(symbol=symbol, interval=interval)
+    try:
+        await run_loop(symbol=symbol, strategy=strategy, interval=interval, max_ticks=args.max_ticks)
         return 0
     finally:
         close_fn = getattr(strategy, "close", None)

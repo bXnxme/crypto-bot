@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timedelta, timezone
+import re
 from typing import Any, Optional, Callable
 
 from .grid_core import GridCore
@@ -58,6 +59,23 @@ def _get(obj: Any, *names: str, default: Any = None) -> Any:
     return default
 
 
+_INTERVAL_RE = re.compile(r"^(\d+)([smhdwM])$")
+
+
+def _normalize_interval(interval: str) -> str:
+    raw = str(interval or "").strip()
+    m = _INTERVAL_RE.match(raw)
+    if m is None:
+        raise ValueError(
+            f"Invalid interval {interval!r}. Expected Binance format like 1m/5m/15m/1h/4h/1d/1w."
+        )
+    qty = int(m.group(1))
+    unit = m.group(2)
+    if qty <= 0:
+        raise ValueError(f"Interval quantity must be > 0, got {interval!r}")
+    return f"{qty}{unit}"
+
+
 
 
 class GridBacktestAdapter:
@@ -66,7 +84,7 @@ class GridBacktestAdapter:
     Design goals:
     - keep strategy state in adapter (anchor, buy levels, open lots)
     - react on every quote (possible marketable orders via paper broker)
-    - optionally react on 15m bar close for reanchor logic parity
+    - optionally react on bar close for reanchor logic parity
     - be resilient to different broker/fill/quote object shapes (duck typing)
 
     This adapter does not depend on backtest CSV code and is safe to run in live/paper loops.
@@ -96,11 +114,8 @@ class GridBacktestAdapter:
         qty_precision_step: Optional[Decimal] = None,
         execution: Any = None,
     ) -> None:
-        if interval != "15m":
-            raise ValueError(f"GridBacktestAdapter supports only interval='15m', got {interval!r}")
-
         self.symbol = symbol
-        self.interval = interval
+        self.interval = _normalize_interval(interval)
         self.grid_step_pct = _d(grid_step_pct)
         self.grid_n_buy = int(grid_n_buy)
 
@@ -175,6 +190,8 @@ class GridBacktestAdapter:
         self._pending_buy_stale_release_seconds: int = 45
         # SELL reconciliation can stay tighter: stale SELL pending keys should be released quickly.
         self._pending_sell_reconcile_grace_seconds: int = 2
+        # Do not let stale closed fill-accumulators block lot recovery forever.
+        self._recover_fill_accum_block_seconds: int = 15
         # After a SELL cancel-replace request, wait a bit before retrying replacement on the same level.
         # This avoids cancel/place storms while exchange open_orders snapshot is still converging.
         self._sell_replace_retry_cooldown_seconds: int = 5
@@ -222,9 +239,9 @@ class GridBacktestAdapter:
         # Key: broker order id / client order id; Value: planned qty (step-rounded).
         self._planned_qty_by_order_ref: dict[str, Decimal] = {}
 
-        # Recovery safety: wallet-based lot synthesis can race with delayed trade polling
-        # and double-count fresh BUY fills. Keep disabled by default in live/demo loop.
-        self._enable_runtime_lot_recovery: bool = False
+        # Recovery safety: wallet-based lot synthesis can race with delayed trade polling.
+        # Keep enabled, but guarded by strict conditions in _recover_missing_open_lots_from_base().
+        self._enable_runtime_lot_recovery: bool = True
         self._lot_recovery_cooldown_after_fill_seconds: int = 30
         # If an order is already closed on exchange but we only saw part of its trade fragments,
         # wait a short grace period for remaining fragments before forced accumulator finalization.
@@ -319,7 +336,7 @@ class GridBacktestAdapter:
             self._sync_broker_orders(broker)
             return
 
-        # Reanchor logic parity with backtest (15m only)
+        # Reanchor logic parity with backtest (bar-close driven).
         reanchor_pct = self.grid_step_pct * Decimal(int(self.grid_reanchor_trigger_steps))
 
         up_trig = self.anchor * (Decimal("1") + reanchor_pct)
@@ -1841,15 +1858,51 @@ class GridBacktestAdapter:
         if not bool(getattr(self, "_enable_runtime_lot_recovery", False)):
             return
 
-        # Avoid racing with still-finalizing partial fills.
-        if self._fill_accum_by_order_ref:
-            return
-
         now_ts = self.last_quote_ts or datetime.now(timezone.utc)
         if now_ts.tzinfo is None:
             now_ts = now_ts.replace(tzinfo=timezone.utc)
         else:
             now_ts = now_ts.astimezone(timezone.utc)
+
+        # Avoid racing with still-finalizing partial fills, but do not block forever
+        # on stale closed accumulators (can happen after reconnects/id reuse).
+        if self._fill_accum_by_order_ref:
+            try:
+                self._finalize_fill_accumulators_from_broker(broker)
+            except Exception:
+                pass
+        if self._fill_accum_by_order_ref:
+            block_sec = int(getattr(self, "_recover_fill_accum_block_seconds", 15))
+            has_open_acc = False
+            has_fresh_closed_acc = False
+            stale_closed_refs: list[str] = []
+            for order_ref, acc in list(self._fill_accum_by_order_ref.items()):
+                order_ref_s = str(order_ref).strip()
+                if not order_ref_s:
+                    continue
+                if self._broker_order_ref_is_open(broker, order_ref_s):
+                    has_open_acc = True
+                    continue
+                acc_ts = acc.get("ts") if isinstance(acc, dict) else None
+                age_sec: Optional[float] = None
+                if isinstance(acc_ts, datetime):
+                    acc_utc = acc_ts if acc_ts.tzinfo is not None else acc_ts.replace(tzinfo=timezone.utc)
+                    age_sec = (now_ts - acc_utc).total_seconds()
+                if age_sec is None or age_sec < float(block_sec):
+                    has_fresh_closed_acc = True
+                else:
+                    stale_closed_refs.append(order_ref_s)
+            if has_open_acc or has_fresh_closed_acc:
+                return
+            if stale_closed_refs:
+                for ref in list(self._fill_accum_by_order_ref.keys()):
+                    self._fill_accum_by_order_ref.pop(ref, None)
+                logger.warning(
+                    "GRID_RECOVER cleared_stale_fill_accum | symbol={} refs={} block_s={}",
+                    self.symbol,
+                    len(stale_closed_refs),
+                    block_sec,
+                )
 
         last_fill_ts = self._last_fill_ts
         if last_fill_ts is not None:
@@ -1861,10 +1914,13 @@ class GridBacktestAdapter:
         if self.last_mid is None or self.last_mid <= 0:
             return
 
-        quote_cash = self._broker_quote_cash(broker)
         eps = self.step_size if self.step_size and self.step_size > 0 else Decimal("0")
         base_total = _round_step(self._broker_base_total(broker), self.step_size) if eps > 0 else _d(self._broker_base_total(broker))
+        base_free = _round_step(self._broker_base_qty(broker), self.step_size) if eps > 0 else _d(self._broker_base_qty(broker))
         if base_total <= 0:
+            return
+        # Do not recover from locked base (e.g. exchange reserved / external constraints).
+        if (base_total - base_free) > (eps * Decimal("2") if eps > 0 else Decimal("0")):
             return
 
         tracked_open_base = Decimal("0")
@@ -1899,86 +1955,37 @@ class GridBacktestAdapter:
         if est_buy_price <= 0:
             return
         est_sell_price = est_buy_price * (Decimal("1") + self.grid_step_pct)
-
-        qty_hint = self._resolve_spend_quote(broker) / ref_px if ref_px > 0 else Decimal("0")
+        lot_qty = recover_qty
         if eps > 0:
-            qty_hint = _round_step(qty_hint, self.step_size)
-        if qty_hint <= 0:
-            qty_hint = recover_qty
+            lot_qty = _round_step(lot_qty, self.step_size)
+        if lot_qty < self.min_qty:
+            return
+        if (lot_qty * est_sell_price) < self.min_notional:
+            return
 
-        max_lots = int(getattr(self, "max_total_orders", self.grid_n_buy))
-        if max_lots <= 0:
-            max_lots = 1
-        # If base is much larger than usual per-order size, distribute it across available slots
-        # so recovery can cover all base with at most `max_lots` SELL exits.
-        max_cover_with_hint = qty_hint * Decimal(max_lots)
-        if max_cover_with_hint > 0 and recover_qty > max_cover_with_hint:
-            qty_hint = recover_qty / Decimal(max_lots)
-            if eps > 0:
-                qty_hint = _round_step(qty_hint, self.step_size)
-            if qty_hint <= 0:
-                qty_hint = recover_qty
+        self._core.state.seq += 1
+        lot = GridLot(
+            buy_price=est_buy_price,
+            sell_price=est_sell_price,
+            qty=lot_qty,
+            cost_quote=(lot_qty * est_buy_price) * (Decimal("1") + self.maker_fee_rate),
+            open_seq=self._core.state.seq,
+        )
+        self._core.state.open_lots.append(lot)
+        self._lot_open_ts_by_key[self._lot_key(lot.sell_price, lot.qty)] = now_ts
 
-        remaining = recover_qty
-        recovered = 0
-        while remaining > 0 and recovered < max_lots:
-            lot_qty = qty_hint if qty_hint > 0 else remaining
-            if lot_qty > remaining:
-                lot_qty = remaining
-            if eps > 0:
-                lot_qty = _round_step(lot_qty, self.step_size)
-            if lot_qty <= 0:
-                break
-
-            tail = remaining - lot_qty
-            if tail > 0 and tail < self.min_qty:
-                lot_qty = remaining
-                if eps > 0:
-                    lot_qty = _round_step(lot_qty, self.step_size)
-
-            if lot_qty < self.min_qty:
-                break
-            if (lot_qty * est_sell_price) < self.min_notional:
-                break
-
-            self._core.state.seq += 1
-            lot = GridLot(
-                buy_price=est_buy_price,
-                sell_price=est_sell_price,
-                qty=lot_qty,
-                cost_quote=(lot_qty * est_buy_price) * (Decimal("1") + self.maker_fee_rate),
-                open_seq=self._core.state.seq,
-            )
-            self._core.state.open_lots.append(lot)
-            self._lot_open_ts_by_key[self._lot_key(lot.sell_price, lot.qty)] = now_ts
-
-            recovered += 1
-            remaining -= lot_qty
-            if eps > 0:
-                remaining = _round_step(remaining, self.step_size)
-
-        if recovered > 0:
+        if lot_qty > 0:
             logger.warning(
-                "GRID_RECOVER synthesized_open_lots | symbol={} recovered_lots={} recovered_qty={} base_total={} tracked_open_base={} reserved_sell_base={} remaining_untracked_base={}",
+                "GRID_RECOVER synthesized_open_lot | symbol={} recovered_qty={} base_total={} base_free={} tracked_open_base={} reserved_sell_base={}",
                 self.symbol,
-                recovered,
-                (recover_qty - remaining),
+                lot_qty,
                 base_total,
+                base_free,
                 tracked_open_base,
                 reserved_in_open_sells,
-                remaining,
             )
             self._mirror_local_state_from_core()
             self._ensure_buy_ladder()
-
-        try:
-            if hasattr(self._core.state, "initial_quote"):
-                initial_quote_now = _d(getattr(self._core.state, "initial_quote", Decimal("0")))
-                deposits_total_now = _d(getattr(self._core.state, "deposits_total", Decimal("0")))
-                if initial_quote_now <= 0 and deposits_total_now <= 0 and quote_cash > 0:
-                    self._core.state.initial_quote = quote_cash
-        except Exception:
-            pass
 
     def _mirror_local_state_from_core(self) -> None:
         """Mirror GridCore ladder/lots into adapter fields used by broker sync + serialization."""
