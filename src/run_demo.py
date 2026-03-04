@@ -457,6 +457,173 @@ class JsonlTelemetryWriter:
     def metric(self, **payload: Any) -> None:
         self._append(self.metrics_path, payload)
 
+
+@dataclass
+class S3BackupUploader:
+    """Optional S3 uploader for state/log backups."""
+
+    bucket: str
+    prefix: str
+    symbol: str
+    endpoint: str
+    region: str
+    _client: Any
+
+    @classmethod
+    def from_env(cls, *, symbol: str) -> "S3BackupUploader | None":
+        enabled_raw = str(os.getenv("RUN_DEMO_GRID_S3_ENABLED", "0")).strip().lower()
+        enabled = enabled_raw in {"1", "true", "yes", "y", "on"}
+        if not enabled:
+            return None
+
+        endpoint = str(
+            os.getenv("RUN_DEMO_GRID_S3_ENDPOINT", os.getenv("S3_ENDPOINT", ""))
+        ).strip()
+        region = str(os.getenv("RUN_DEMO_GRID_S3_REGION", os.getenv("S3_REGION", "ru-1"))).strip()
+        bucket = str(os.getenv("RUN_DEMO_GRID_S3_BUCKET", os.getenv("S3_BUCKET", ""))).strip()
+        access_key = str(
+            os.getenv("RUN_DEMO_GRID_S3_ACCESS_KEY", os.getenv("S3_ACCESS_KEY", ""))
+        ).strip()
+        secret_key = str(
+            os.getenv("RUN_DEMO_GRID_S3_SECRET_KEY", os.getenv("S3_SECRET_KEY", ""))
+        ).strip()
+        prefix = str(os.getenv("RUN_DEMO_GRID_S3_PREFIX", "demo-grid")).strip().strip("/")
+
+        missing = []
+        if not endpoint:
+            missing.append("RUN_DEMO_GRID_S3_ENDPOINT or S3_ENDPOINT")
+        if not bucket:
+            missing.append("RUN_DEMO_GRID_S3_BUCKET or S3_BUCKET")
+        if not access_key:
+            missing.append("RUN_DEMO_GRID_S3_ACCESS_KEY or S3_ACCESS_KEY")
+        if not secret_key:
+            missing.append("RUN_DEMO_GRID_S3_SECRET_KEY or S3_SECRET_KEY")
+        if missing:
+            logger.warning(
+                "S3 backup disabled: missing env vars: {}",
+                ", ".join(missing),
+            )
+            return None
+
+        try:
+            import boto3  # type: ignore
+        except Exception as e:
+            logger.warning("S3 backup disabled: boto3 import failed: {}", e)
+            return None
+
+        try:
+            session = boto3.session.Session(
+                aws_access_key_id=access_key,
+                aws_secret_access_key=secret_key,
+                region_name=region or None,
+            )
+            client = session.client(
+                "s3",
+                endpoint_url=endpoint,
+                region_name=region or None,
+            )
+        except Exception as e:
+            logger.warning("S3 backup disabled: cannot build S3 client: {}", e)
+            return None
+
+        return cls(
+            bucket=bucket,
+            prefix=prefix,
+            symbol=str(symbol or "").strip().upper(),
+            endpoint=endpoint,
+            region=region,
+            _client=client,
+        )
+
+    @property
+    def _root(self) -> str:
+        safe_symbol = re.sub(r"[^a-zA-Z0-9_-]+", "_", self.symbol.lower())
+        if self.prefix:
+            return f"{self.prefix}/{safe_symbol}"
+        return safe_symbol
+
+    def _state_key(self) -> str:
+        return f"{self._root}/state/latest.json"
+
+    def _quotes_key(self) -> str:
+        return f"{self._root}/logs/quotes_latest.jsonl"
+
+    def _trades_key(self) -> str:
+        return f"{self._root}/logs/trades_latest.jsonl"
+
+    def _metrics_key(self) -> str:
+        return f"{self._root}/logs/metrics_latest.jsonl"
+
+    def _upload_file_sync(self, *, local_path: Path, object_key: str) -> bool:
+        if not local_path.exists():
+            return False
+        self._client.upload_file(str(local_path), self.bucket, object_key)
+        return True
+
+    async def upload_state(self, *, state_path: Path, reason: str, tick: int | None = None) -> None:
+        object_key = self._state_key()
+        try:
+            ok = await asyncio.to_thread(
+                self._upload_file_sync,
+                local_path=state_path,
+                object_key=object_key,
+            )
+            if ok:
+                logger.debug(
+                    "S3 upload state ok | bucket={} key={} reason={} tick={}",
+                    self.bucket,
+                    object_key,
+                    reason,
+                    tick if tick is not None else "?",
+                )
+        except Exception as e:
+            logger.warning(
+                "S3 upload state failed | bucket={} key={} reason={} err={}",
+                self.bucket,
+                object_key,
+                reason,
+                e,
+            )
+
+    async def upload_logs(
+        self,
+        *,
+        quotes_path: Path,
+        trades_path: Path,
+        metrics_path: Path,
+        reason: str,
+    ) -> None:
+        files = (
+            (quotes_path, self._quotes_key()),
+            (trades_path, self._trades_key()),
+            (metrics_path, self._metrics_key()),
+        )
+        uploaded = 0
+        for local_path, object_key in files:
+            try:
+                ok = await asyncio.to_thread(
+                    self._upload_file_sync,
+                    local_path=local_path,
+                    object_key=object_key,
+                )
+                if ok:
+                    uploaded += 1
+            except Exception as e:
+                logger.warning(
+                    "S3 upload log failed | bucket={} key={} reason={} err={}",
+                    self.bucket,
+                    object_key,
+                    reason,
+                    e,
+                )
+        if uploaded > 0:
+            logger.debug(
+                "S3 upload logs ok | bucket={} uploaded={} reason={}",
+                self.bucket,
+                uploaded,
+                reason,
+            )
+
 # --- Helper functions for telemetry/heartbeat ---
 def _safe_strategy_fields(strategy: Any, execution: Any | None = None) -> dict[str, Any]:
     """Best-effort adapter telemetry for heartbeat/stop logs."""
@@ -775,7 +942,21 @@ def _apply_runtime_state(*, state: dict[str, Any], strategy: Any, runtime_stats:
         logger.warning("Strategy state restore failed: {}", e)
 
 
-async def _periodic_state_flush_task(*, symbol: str, strategy: Any, execution: Any, runtime_stats: dict[str, Any], tick_count_ref: dict[str, int], path: Path, interval_sec: float, stop_evt: asyncio.Event, jsonl: JsonlTelemetryWriter) -> None:
+async def _periodic_state_flush_task(
+    *,
+    symbol: str,
+    strategy: Any,
+    execution: Any,
+    runtime_stats: dict[str, Any],
+    tick_count_ref: dict[str, int],
+    path: Path,
+    interval_sec: float,
+    stop_evt: asyncio.Event,
+    jsonl: JsonlTelemetryWriter,
+    s3_uploader: S3BackupUploader | None = None,
+    s3_log_sync_sec: float = 0.0,
+) -> None:
+    next_s3_logs_sync_mono = 0.0
     while not stop_evt.is_set():
         try:
             await asyncio.wait_for(stop_evt.wait(), timeout=interval_sec)
@@ -794,7 +975,31 @@ async def _periodic_state_flush_task(*, symbol: str, strategy: Any, execution: A
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps(payload, ensure_ascii=False, default=_json_default, indent=2), encoding="utf-8")
             logger.debug("STATE: periodic flush completed")
-            jsonl.metric(kind="state_flush", ts=datetime.now(timezone.utc), symbol=symbol, tick=tick_count_ref.get("tick_count", 0), path=str(path))
+            tick_no = int(tick_count_ref.get("tick_count", 0))
+            jsonl.metric(
+                kind="state_flush",
+                ts=datetime.now(timezone.utc),
+                symbol=symbol,
+                tick=tick_no,
+                path=str(path),
+            )
+
+            if s3_uploader is not None:
+                await s3_uploader.upload_state(
+                    state_path=path,
+                    reason="periodic",
+                    tick=tick_no,
+                )
+                if s3_log_sync_sec > 0:
+                    now_mono = asyncio.get_running_loop().time()
+                    if now_mono >= next_s3_logs_sync_mono:
+                        await s3_uploader.upload_logs(
+                            quotes_path=jsonl.quotes_path,
+                            trades_path=jsonl.trades_path,
+                            metrics_path=jsonl.metrics_path,
+                            reason="periodic",
+                        )
+                        next_s3_logs_sync_mono = now_mono + float(s3_log_sync_sec)
         except Exception as e:
             logger.warning("STATE: periodic flush failed: {}", e)
 
@@ -955,7 +1160,19 @@ async def run_loop(*, symbol: str, strategy: Any, interval: str = "15m", max_tic
 
     state_path = Path(os.getenv("RUN_DEMO_GRID_STATE_FILE", "data/run_demo_grid_state.json"))
     state_flush_sec = float(os.getenv("RUN_DEMO_GRID_STATE_FLUSH_SEC", "15"))
+    s3_log_sync_sec = float(os.getenv("RUN_DEMO_GRID_S3_LOG_SYNC_SEC", "0"))
+    s3_uploader = S3BackupUploader.from_env(symbol=symbol)
     state_loaded = False
+
+    if s3_uploader is not None:
+        logger.info(
+            "S3 backup enabled | endpoint={} bucket={} region={} prefix={} log_sync_sec={}",
+            s3_uploader.endpoint,
+            s3_uploader.bucket,
+            s3_uploader.region,
+            s3_uploader.prefix or "-",
+            s3_log_sync_sec,
+        )
 
     # Optional: inject live execution into adapter/strategy if it supports it.
     for attr_name in ("set_execution", "attach_execution", "bind_execution"):
@@ -1089,6 +1306,8 @@ async def run_loop(*, symbol: str, strategy: Any, interval: str = "15m", max_tic
                 interval_sec=state_flush_sec,
                 stop_evt=state_stop_evt,
                 jsonl=jsonl,
+                s3_uploader=s3_uploader,
+                s3_log_sync_sec=s3_log_sync_sec,
             )
         )
 
@@ -1791,26 +2010,43 @@ async def run_loop(*, symbol: str, strategy: Any, interval: str = "15m", max_tic
         )
 
         try:
-            final_state = _capture_runtime_state(
-                symbol=symbol,
-                strategy=strategy,
-                execution=execution,
-                runtime_stats=runtime_stats,
-                tick_count=(tick_count if 'tick_count' in locals() else 0),
-            )
-            state_path.parent.mkdir(parents=True, exist_ok=True)
-            state_path.write_text(json.dumps(final_state, ensure_ascii=False, default=_json_default, indent=2), encoding="utf-8")
-            logger.debug("STATE: final flush completed")
-        except Exception as e:
-            logger.warning("STATE: final flush failed: {}", e)
-
-        try:
             state_stop_evt.set()
             if state_task is not None:
                 with contextlib.suppress(Exception):
                     await state_task
         except Exception:
             pass
+
+        try:
+            final_tick = tick_count if "tick_count" in locals() else 0
+            final_state = _capture_runtime_state(
+                symbol=symbol,
+                strategy=strategy,
+                execution=execution,
+                runtime_stats=runtime_stats,
+                tick_count=final_tick,
+            )
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            state_path.write_text(
+                json.dumps(final_state, ensure_ascii=False, default=_json_default, indent=2),
+                encoding="utf-8",
+            )
+            logger.debug("STATE: final flush completed")
+
+            if s3_uploader is not None:
+                await s3_uploader.upload_state(
+                    state_path=state_path,
+                    reason="final",
+                    tick=final_tick,
+                )
+                await s3_uploader.upload_logs(
+                    quotes_path=jsonl.quotes_path,
+                    trades_path=jsonl.trades_path,
+                    metrics_path=jsonl.metrics_path,
+                    reason="final",
+                )
+        except Exception as e:
+            logger.warning("STATE: final flush failed: {}", e)
 
         try:
             jsonl.metric(

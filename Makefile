@@ -32,6 +32,7 @@ help:
 	@echo "Useful overrides:"
 	@echo "  SYMBOL=..., INTERVAL=..., MAX_TICKS=..., LOG_LEVEL=..., EXTRA='...'"
 	@echo "  STATE_FILE=... (used by demo_fresh/demo_state)"
+	@echo "  RUN_DEMO_GRID_S3_ENABLED=1 + RUN_DEMO_GRID_S3_* (optional S3 backups)"
 
 venv:
 	@test -d .venv || python -m venv .venv
