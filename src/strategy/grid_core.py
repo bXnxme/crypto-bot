@@ -264,57 +264,115 @@ class GridCore:
             note="buy_opened_lot",
         )
 
-    def on_sell_fill(self, *, qty: Decimal, price: Decimal, fee_quote: Decimal) -> FillResult:
-        """Process SELL fill, close one lot FIFO-ish by exact qty/nearest qty, and return next BUY intent."""
+    def on_sell_fill(
+        self,
+        *,
+        qty: Decimal,
+        price: Decimal,
+        fee_quote: Decimal,
+        level_price: Optional[Decimal] = None,
+    ) -> FillResult:
+        """Process SELL fill and close one or more lots (supports aggregated fills)."""
         if not self.state.open_lots:
             return FillResult(matched=False, note="no_open_lots")
+        if qty <= 0:
+            return FillResult(matched=False, note="non_positive_sell_qty")
 
-        # Prefer exact-qty lot; fallback to nearest qty to tolerate step/rounding drift.
-        lot_idx = None
-        for i, lot in enumerate(self.state.open_lots):
-            if lot.qty == qty:
-                lot_idx = i
+        eps = self.cfg.qty_step if self.cfg.qty_step > 0 else Decimal("0")
+        remaining = qty
+        requested = qty
+        total_pnl = Decimal("0")
+        matched_any = False
+        last_closed_buy_level = Decimal("0")
+
+        while remaining > eps and self.state.open_lots:
+            lot_idx: Optional[int] = None
+
+            if level_price is not None:
+                # For consolidated SELL orders, prefer lots closest to the target SELL level.
+                lot_idx = min(
+                    range(len(self.state.open_lots)),
+                    key=lambda i: abs(self.state.open_lots[i].sell_price - level_price),
+                )
+            else:
+                for i, lot in enumerate(self.state.open_lots):
+                    if lot.qty == remaining:
+                        lot_idx = i
+                        break
+                if lot_idx is None:
+                    lot_idx = min(
+                        range(len(self.state.open_lots)),
+                        key=lambda i: abs(self.state.open_lots[i].qty - remaining),
+                    )
+
+            lot = self.state.open_lots[lot_idx]
+            if lot.qty <= 0:
+                self.state.open_lots.pop(lot_idx)
+                continue
+
+            sold_qty = remaining if remaining <= lot.qty else lot.qty
+            if sold_qty <= 0:
                 break
-        if lot_idx is None:
-            lot_idx = min(range(len(self.state.open_lots)), key=lambda i: abs(self.state.open_lots[i].qty - qty))
 
-        lot = self.state.open_lots.pop(lot_idx)
+            fee_part = Decimal("0")
+            if fee_quote > 0 and requested > 0:
+                fee_part = fee_quote * (sold_qty / requested)
 
-        proceeds = (qty * price) - fee_quote
-        pnl = proceeds - lot.cost_quote
+            lot_cost_sold = lot.cost_quote * (sold_qty / lot.qty)
+            proceeds = (sold_qty * price) - fee_part
+            pnl = proceeds - lot_cost_sold
 
-        self.state.quote += proceeds
-        self.state.base -= qty
-        self.state.fills_sell += 1
-        self.state.realized_pnl_quote += pnl
+            self.state.quote += proceeds
+            self.state.base -= sold_qty
+            self.state.fills_sell += 1
+            self.state.realized_pnl_quote += pnl
 
-        # After sell, restore one buy level one step below the lot's sell level.
-        next_buy_level = lot.sell_price * (Decimal("1") - self.cfg.step_pct)
-        if next_buy_level > 0:
-            self.state.buy_levels.add(next_buy_level)
+            total_pnl += pnl
+            matched_any = True
+
+            lot_remaining = lot.qty - sold_qty
+            lot_fully_closed = lot_remaining <= eps
+            if lot_fully_closed:
+                self.state.open_lots.pop(lot_idx)
+                next_buy_level = lot.sell_price * (Decimal("1") - self.cfg.step_pct)
+                if next_buy_level > 0:
+                    self.state.buy_levels.add(next_buy_level)
+                    last_closed_buy_level = next_buy_level
+            else:
+                lot.qty = lot_remaining
+                lot.cost_quote = lot.cost_quote - lot_cost_sold
+
+            remaining -= sold_qty
+
+        if not matched_any:
+            return FillResult(matched=False, note="no_matching_lot")
+
+        if self.state.base < 0 and abs(self.state.base) <= eps:
+            self.state.base = Decimal("0")
 
         self.state.update_drawdown(price)
 
         next_order = None
-        if next_buy_level > 0 and self.can_add_base(next_buy_level):
+        if last_closed_buy_level > 0 and self.can_add_base(last_closed_buy_level):
             spend_now = self._spend_quote_now()
             if spend_now > 0:
-                next_qty = self.calc_qty_for_quote(spend_now, next_buy_level)
-                if self._passes_exchange_like_filters(next_qty, next_buy_level):
-                    cost_quote = (next_qty * next_buy_level) * (Decimal("1") + self.cfg.maker_fee_rate)
+                next_qty = self.calc_qty_for_quote(spend_now, last_closed_buy_level)
+                if self._passes_exchange_like_filters(next_qty, last_closed_buy_level):
+                    cost_quote = (next_qty * last_closed_buy_level) * (Decimal("1") + self.cfg.maker_fee_rate)
                     if cost_quote <= self.state.quote:
                         next_order = PlaceIntent(
                             side=Side.BUY,
                             qty=next_qty,
-                            limit_price=next_buy_level,
+                            limit_price=last_closed_buy_level,
                             reason="pair_after_sell",
                         )
 
+        note = "sell_closed_lot" if remaining <= eps else "sell_partially_closed_lot"
         return FillResult(
             next_order=next_order,
-            realized_pnl_quote=pnl,
+            realized_pnl_quote=total_pnl,
             matched=True,
-            note="sell_closed_lot",
+            note=note,
         )
 
     # ---------- diagnostics ----------
@@ -324,11 +382,8 @@ class GridCore:
             "quote": self.state.quote,
             "base": self.state.base,
             "equity": self.state.equity(mark_price),
-            "equity_gross": self.state.equity_gross(mark_price),
             "contributed_total": self.state.contributed_total(),
             "profit_total": self.state.profit_total(mark_price),
-            "profit_unwithdrawn": self.state.profit_unwithdrawn(mark_price),
-            "withdrawable_profit_quote": self.state.withdrawable_profit_quote(),
             "anchor": self.state.anchor,
             "buy_levels": len(self.state.buy_levels),
             "open_lots": len(self.state.open_lots),

@@ -829,8 +829,22 @@ class BinanceDemoExecution:
                 qty = self._d(tr.get("qty", "0"))
                 price = self._d(tr.get("price", "0"))
                 fee = self._d(tr.get("commission", "0"))
+                commission_asset = str(tr.get("commissionAsset", "") or "").strip().upper()
                 side = "BUY" if bool(tr.get("isBuyer", False)) else "SELL"
                 maker = bool(tr.get("isMaker", False))
+
+                fee_quote = Decimal("0")
+                fee_base = Decimal("0")
+                try:
+                    quote_asset_u = str(self.quote_asset or "").strip().upper()
+                    base_asset_u = str(self.base_asset or "").strip().upper()
+                    if commission_asset and commission_asset == quote_asset_u:
+                        fee_quote = fee
+                    elif commission_asset and commission_asset == base_asset_u:
+                        fee_base = fee
+                except Exception:
+                    fee_quote = Decimal("0")
+                    fee_base = Decimal("0")
 
                 oid_s = str(order_id) if order_id is not None else ""
                 cached = self._order_state_cache.get(oid_s) if oid_s else None
@@ -888,9 +902,17 @@ class BinanceDemoExecution:
                     side=side,
                     qty=qty,
                     price=price,
-                    fee_quote=fee,
+                    fee_quote=fee_quote,
                     maker=maker,
                 )
+
+                try:
+                    if commission_asset:
+                        setattr(fill_obj, "commission_asset", commission_asset)
+                    if fee_base > 0:
+                        setattr(fill_obj, "fee_base", fee_base)
+                except Exception:
+                    pass
 
                 try:
                     setattr(fill_obj, "status", status_fill)
@@ -1078,26 +1100,51 @@ class BinanceDemoExecution:
         if sig in self._pending_submit_sigs:
             for o in self.open_orders:
                 try:
-                    if self._make_order_sig(
-                        getattr(o, "side", ""),
-                        self._d(getattr(o, "qty", "0")),
-                        self._d(getattr(o, "limit_price", "0")),
-                    ) == sig:
+                    if isinstance(o, dict):
+                        o_side = str(o.get("side", "")).upper()
+                        o_qty = self._d(o.get("origQty", o.get("orig_qty", o.get("qty", "0"))))
+                        o_px = self._d(o.get("price", o.get("limit_price", "0")))
+                    else:
+                        o_side = self._norm_side(getattr(o, "side", ""))
+                        o_qty = self._d(getattr(o, "qty", "0"))
+                        o_px = self._d(getattr(o, "limit_price", "0"))
+                    if self._make_order_sig(o_side, o_qty, o_px) == sig:
                         return o
                 except Exception:
                     continue
-            # Fallback: pending sig exists but placeholder not found (race). Skip duplicate submit.
-            local_id = self._next_local_order_id()
-            ghost = DemoPlacedOrder(
-                order_id=local_id,
-                symbol=self.symbol,
-                side=side_s,
-                qty=qty_d,
-                limit_price=px_d,
-                status="DUPLICATE_SKIPPED",
-                ts=datetime.now(timezone.utc),
+
+            # Pending signature exists but no matching open order.
+            # This means dedupe cache is stale; clear it and proceed with fresh placement.
+            stale_local_ids: list[str] = []
+            for local_id, local_sig in list(self._local_order_sig.items()):
+                if local_sig == sig:
+                    stale_local_ids.append(str(local_id))
+            for local_id in stale_local_ids:
+                self._local_order_sig.pop(local_id, None)
+                self._pending_local_orders.pop(local_id, None)
+            if stale_local_ids:
+                stale_local_set = set(stale_local_ids)
+                try:
+                    self.open_orders = [
+                        o
+                        for o in self.open_orders
+                        if not (
+                            not isinstance(o, dict)
+                            and str(getattr(o, "order_id", "")) in stale_local_set
+                        )
+                    ]
+                except Exception:
+                    pass
+            self.local_pending_open_orders_count = len(self._pending_local_orders)
+            self._pending_submit_sigs.discard(sig)
+            logger.warning(
+                "DEMO PLACE_LIMIT stale dedupe signature cleared | symbol={} side={} qty={} price={} stale_local_ids={}",
+                self.symbol,
+                side_s,
+                qty_d,
+                px_d,
+                stale_local_ids,
             )
-            return ghost
 
         # Also guard against already-confirmed broker open order duplicates.
         for o in self.open_orders:
@@ -1341,10 +1388,10 @@ class BinanceDemoExecution:
             qty_send = self._d(self._fmt_dec(qty_send))
             px_send = self._d(self._fmt_dec(px_send))
 
-            # SELL safety: Binance may deduct commission in base asset (e.g. ETH),
-            # so the filled base qty can be slightly lower than strategy lot qty.
-            # Clamp SELL quantity to currently available free base balance to avoid
-            # repeated -2010 insufficient balance rejects.
+            # SELL safety:
+            # - allow tiny clamp (dust-level) to absorb rounding/commission tails
+            # - but reject significant shortfall instead of placing partial SELL,
+            #   otherwise adapter enters cancel/replace churn on qty mismatch
             if str(side).upper() == "SELL":
                 try:
                     await self.refresh_balances()
@@ -1356,20 +1403,32 @@ class BinanceDemoExecution:
                     free_base = self._round_down_step(free_base, self._qty_step_size)
                 free_base = self._d(self._fmt_dec(free_base))
 
-                if free_base > 0 and qty_send > free_base:
-                    old_qty = qty_send
-                    qty_send = free_base
-                    sig_warn = f"{self.symbol}|SELL|{self._fmt_dec(old_qty)}|{self._fmt_dec(qty_send)}|{self._fmt_dec(px_send)}"
-                    if getattr(self, "_warned_sell_balance_adjust_sig", None) != sig_warn:
-                        logger.info(
-                            "DEMO PLACE_LIMIT sell qty adjusted to free balance | symbol={} requested_qty={} adjusted_qty={} free_base={} price={}",
-                            self.symbol,
-                            old_qty,
-                            qty_send,
-                            free_base,
-                            px_send,
+                if qty_send > free_base:
+                    shortfall = qty_send - free_base
+                    tiny_shortfall = Decimal("0")
+                    if self._qty_step_size and self._qty_step_size > 0:
+                        tiny_shortfall = self._qty_step_size * Decimal("2")
+
+                    if shortfall <= tiny_shortfall and free_base > 0:
+                        old_qty = qty_send
+                        qty_send = free_base
+                        sig_warn = f"{self.symbol}|SELL|{self._fmt_dec(old_qty)}|{self._fmt_dec(qty_send)}|{self._fmt_dec(px_send)}"
+                        if getattr(self, "_warned_sell_balance_adjust_sig", None) != sig_warn:
+                            logger.info(
+                                "DEMO PLACE_LIMIT sell qty adjusted to free balance | symbol={} requested_qty={} adjusted_qty={} free_base={} price={}",
+                                self.symbol,
+                                old_qty,
+                                qty_send,
+                                free_base,
+                                px_send,
+                            )
+                            self._warned_sell_balance_adjust_sig = sig_warn
+                    else:
+                        raise RuntimeError(
+                            f"SELL_QTY_EXCEEDS_FREE_BASE requested={self._fmt_dec(qty_send)} "
+                            f"free_base={self._fmt_dec(free_base)} shortfall={self._fmt_dec(shortfall)} "
+                            f"price={self._fmt_dec(px_send)}"
                         )
-                        self._warned_sell_balance_adjust_sig = sig_warn
 
             # BUY safety: clamp to free quote balance to avoid -2010 insufficient balance.
             elif str(side).upper() == "BUY":
@@ -1477,6 +1536,30 @@ class BinanceDemoExecution:
 
         except Exception as e:
             err_detail = self._format_exc(e)
+            err_s = (str(e) or "").strip()
+            if not err_s:
+                err_s = err_detail
+            err_l = err_s.lower()
+
+            # Exchange already has an equivalent order. Keep placeholder as ACK-pending and
+            # resync snapshot so adapter/order-dedupe converges without repeated re-submits.
+            if "duplicate order sent" in err_l:
+                local_order.status = "ACK_PENDING_SYNC"
+                try:
+                    await self.refresh_open_orders()
+                except Exception:
+                    pass
+                logger.info(
+                    "DEMO PLACE_LIMIT duplicate treated as already_open | symbol={} side={} qty={} price={} local_order_id={} err={}",
+                    self.symbol,
+                    side,
+                    qty,
+                    limit_price,
+                    getattr(local_order, "order_id", None),
+                    err_s,
+                )
+                return
+
             local_order.status = "REJECTED"
             try:
                 local_id = str(getattr(local_order, "order_id", ""))
@@ -1492,9 +1575,6 @@ class BinanceDemoExecution:
                 pass
             self.local_pending_open_orders_count = len(self._pending_local_orders)
 
-            err_s = (str(e) or "").strip()
-            if not err_s:
-                err_s = err_detail
             if "insufficient balance" in err_s.lower() and str(side).upper() == "SELL":
                 logger.debug(
                     "DEMO PLACE_LIMIT sell rejected (insufficient balance) | symbol={} side={} qty={} price={} err={} detail={}",

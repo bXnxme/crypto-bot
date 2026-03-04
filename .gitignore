@@ -1,6 +1,21 @@
+# Python
 .venv/
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Local secrets
 .env
+.env.*
+!.env.example
+
+# Runtime artifacts
 logs/
+data/run_demo_grid_state*.json
+data/run_demo_grid_state*.json.*
+data/*.bak*
+!data/.gitkeep
+
+# OS
 .DS_Store

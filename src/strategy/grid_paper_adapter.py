@@ -62,31 +62,6 @@ class AdapterSnapshot:
     closed_candles: int
 
 
-@dataclass(frozen=True)
-class YearBoundaryEvent:
-    """Signal that a calendar year has rolled over on 15m candle close.
-
-    Emitted when the adapter closes the last 15m candle of the previous year and
-    sees the first tick of the new year bucket.
-    """
-
-    symbol: str
-    closed_candle: Candle15m
-    next_bucket_open: datetime
-    year_closed: int
-    year_opened: int
-
-    @property
-    def ts(self) -> datetime:
-        """Compatibility alias for runtime callbacks: timestamp of the first bucket in the new year."""
-        return self.next_bucket_open
-
-    @property
-    def year(self) -> int:
-        """Compatibility alias for runtime callbacks: the newly opened calendar year."""
-        return self.year_opened
-
-
 def floor_to_15m(ts: datetime) -> datetime:
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=UTC)
@@ -111,16 +86,13 @@ class GridPaperAdapter:
         self,
         symbol: str,
         on_candle_close: Optional[Callable[[Candle15m], None]] = None,
-        on_year_boundary: Optional[Callable[[YearBoundaryEvent], None]] = None,
     ) -> None:
         self.symbol = symbol.upper()
         self.on_candle_close = on_candle_close
-        self.on_year_boundary = on_year_boundary
 
         self._cur_bucket_open: Optional[datetime] = None
         self._cur: Optional[Candle15m] = None
         self._closed_count = 0
-        self._pending_year_boundary_event: Optional[YearBoundaryEvent] = None
 
     def snapshot(self) -> AdapterSnapshot:
         return AdapterSnapshot(
@@ -259,31 +231,7 @@ class GridPaperAdapter:
         if self.on_candle_close is not None:
             self.on_candle_close(closed)
 
-        # Detect calendar year rollover on candle boundary:
-        # closed candle is the last candle of previous year, current bucket is first bucket of new year.
-        # Example: closed.close_time == 2027-01-01T00:00:00Z while closed.open_time is in 2026.
-        if closed.close_time.year != bucket_open.year:
-            ev = YearBoundaryEvent(
-                symbol=self.symbol,
-                closed_candle=closed,
-                next_bucket_open=bucket_open,
-                year_closed=closed.open_time.year,
-                year_opened=bucket_open.year,
-            )
-            self._pending_year_boundary_event = ev
-            if self.on_year_boundary is not None:
-                self.on_year_boundary(ev)
-
         return closed
-
-    def pop_year_boundary_event(self) -> Optional[YearBoundaryEvent]:
-        """Return and clear the latest detected year-boundary event (if any).
-
-        This is useful when `run_paper` prefers polling instead of callbacks.
-        """
-        ev = self._pending_year_boundary_event
-        self._pending_year_boundary_event = None
-        return ev
 
     def flush_current(self) -> Optional[Candle15m]:
         """Return current unfinished candle (without advancing state).

@@ -166,7 +166,38 @@ class GridBacktestAdapter:
         self.pending_buy_levels: dict[str, Decimal] = {}
         self.pending_sell_levels: dict[str, Decimal] = {}
         self._pending_buy_seen_at: dict[str, datetime] = {}
-        self._pending_reconcile_grace_seconds: int = 5
+        self._pending_sell_seen_at: dict[str, datetime] = {}
+        # BUY snapshots on demo/live can lag for tens of seconds around reconnects;
+        # keep local BUY pending keys longer to avoid overplacing duplicate ladder levels.
+        self._pending_buy_reconcile_grace_seconds: int = 120
+        # If a BUY pending key is not visible on broker open orders for too long, release it.
+        # This prevents BUY ladder underfill (e.g. 4/5 levels) after stale local pending refs.
+        self._pending_buy_stale_release_seconds: int = 45
+        # SELL reconciliation can stay tighter: stale SELL pending keys should be released quickly.
+        self._pending_sell_reconcile_grace_seconds: int = 2
+        # After a SELL cancel-replace request, wait a bit before retrying replacement on the same level.
+        # This avoids cancel/place storms while exchange open_orders snapshot is still converging.
+        self._sell_replace_retry_cooldown_seconds: int = 5
+        self._sell_replace_cooldown_until_by_key: dict[str, datetime] = {}
+        # If exchange snapshot lags and we over-accumulate BUY orders, trim BUYs to free slots for SELLs.
+        self._order_slot_rebalance_cooldown_seconds: int = 2
+        # Right after a fill, broker open_orders snapshot can still contain the already-filled BUY.
+        # Do not rebalance slots immediately, otherwise we may cancel a valid BUY unnecessarily.
+        self._order_slot_rebalance_after_fill_cooldown_seconds: int = 8
+        self._last_order_slot_rebalance_ts: Optional[datetime] = None
+        # Broker balance snapshots can lag immediately after fills; require persistent mismatch
+        # before trimming lots against wallet base.
+        self._drop_excess_confirm_seconds: int = 8
+        self._drop_excess_cooldown_after_fill_seconds: int = 15
+        self._drop_excess_candidate_since: Optional[datetime] = None
+        # Keep strictly one BUY order per price level on exchange.
+        self._buy_price_dedupe_cooldown_seconds: int = 2
+        self._last_buy_price_dedupe_ts: Optional[datetime] = None
+        # Enforce BUY ladder shape/cap even if broker snapshot lags behind true exchange state.
+        self._buy_ladder_prune_cooldown_seconds: int = 2
+        self._last_buy_ladder_prune_ts: Optional[datetime] = None
+        self._buy_freeze_log_every_seconds: int = 5
+        self._last_buy_freeze_log_ts: Optional[datetime] = None
 
         # Bind broker order ids to strategy levels so partial fills keep the same mapping.
         self._buy_level_by_order_ref: dict[str, Decimal] = {}
@@ -180,13 +211,24 @@ class GridBacktestAdapter:
 
         # Aggregate partial fills by order id so strategy state transitions happen
         # only when the full order is completed (prevents premature BUY->SELL / SELL->BUY placement).
-        # Stored payload: {"side": str, "qty": Decimal, "quote_sum": Decimal, "fee_quote": Decimal, "ts": Optional[datetime]}
+        # Stored payload:
+        # {"side": str, "qty": Decimal, "quote_sum": Decimal, "fee_quote": Decimal, "fee_base": Decimal, "ts": Optional[datetime]}
         self._fill_accum_by_order_ref: dict[str, dict[str, Any]] = {}
+        # Timestamp of the most recent processed fill (used to avoid aggressive lot recovery races).
+        self._last_fill_ts: Optional[datetime] = None
 
         # Planned order qty captured at placement time (by broker order id).
         # Used to safely finalize partial fills even if broker open_orders snapshot lags.
         # Key: broker order id / client order id; Value: planned qty (step-rounded).
         self._planned_qty_by_order_ref: dict[str, Decimal] = {}
+
+        # Recovery safety: wallet-based lot synthesis can race with delayed trade polling
+        # and double-count fresh BUY fills. Keep disabled by default in live/demo loop.
+        self._enable_runtime_lot_recovery: bool = False
+        self._lot_recovery_cooldown_after_fill_seconds: int = 30
+        # If an order is already closed on exchange but we only saw part of its trade fragments,
+        # wait a short grace period for remaining fragments before forced accumulator finalization.
+        self._fill_accum_finalize_grace_seconds: int = 3
 
         # Diagnostics
         self.fills_buy = 0
@@ -212,25 +254,9 @@ class GridBacktestAdapter:
         self._peak_equity: Optional[Decimal] = None
         self._max_dd_abs = Decimal("0")
         self._max_dd_pct = Decimal("0")
-        self.retained_profit_base = Decimal("0")
 
         # Cashflow accounting mirrors (paper/runtime can call register_* methods).
-        # Core state remains the source of truth for contributed/withdrawn totals when available.
         self.manual_deposits_total = Decimal("0")
-        self.manual_withdrawals_total = Decimal("0")
-
-        # Year-end withdrawal workflow (request-only; no real transfer here)
-        self.pending_year_end_withdrawal = False
-        self.pending_year_end_withdrawal_deadline_ts: Optional[datetime] = None
-        self.pending_year_end_profit_quote = Decimal("0")
-        self.pending_year_end_withdraw_quote = Decimal("0")
-        self.pending_year_end_retain_quote = Decimal("0")
-        self.pending_year_end_trigger_ts: Optional[datetime] = None
-        self._last_year_end_gate_key: Optional[str] = None
-        # Year-end liquidation state
-        self.year_end_liquidation_active = False
-        self.year_end_liquidation_started_ts: Optional[datetime] = None
-        self.year_end_liquidation_target_base_qty = Decimal("0")
 
         # GridCore-backed state for ladder/lots (broker balances remain source of truth for equity).
         self._core = GridCore(
@@ -265,9 +291,10 @@ class GridBacktestAdapter:
         self.last_quote_ts = ts
         self._sync_fee_rates_from_runtime(broker)
         self._sync_core_balances_from_broker(broker)
-        self._reconcile_pending_levels_from_broker(broker)
         self._finalize_fill_accumulators_from_broker(broker)
-        self.expire_year_end_withdrawal_if_needed(ts)
+        self._drop_excess_open_lots_from_base(broker)
+        self._recover_missing_open_lots_from_base(broker)
+        self._reconcile_pending_levels_from_broker(broker)
 
         if not self.init_done:
             self._bootstrap_grid()
@@ -316,10 +343,6 @@ class GridBacktestAdapter:
             self._cancel_all_strategy_orders(broker)
             self._sync_broker_orders(broker)
 
-        # Year-end gate / request creation is evaluated on closed 15m bars.
-        # We expect `ts` to be the candle close time (GridPaperAdapter provides `close_time`).
-        self._maybe_open_year_end_withdrawal_window(broker, ts)
-
     def on_fill(self, broker: Any, fill: Any) -> None:
         side_raw = _get(fill, "side", default=None)
         side = self._norm_side(side_raw)
@@ -330,8 +353,35 @@ class GridBacktestAdapter:
         qty = _d(_get(fill, "qty", "quantity", default=0))
         px = _d(_get(fill, "price", "px", default=0))
         fee_quote = _d(_get(fill, "fee_quote", "fee", default=0))
+        fee_base = _d(_get(fill, "fee_base", default=0))
         ts = self._parse_ts(_get(fill, "ts", "timestamp", "time", default=None))
         order_ref = self._fill_order_ref(fill)
+        client_ref = self._fill_client_ref(fill)
+        force_finalize = bool(_get(fill, "force_finalize", default=False))
+
+        # Bridge LOCAL-* refs to exchange order id once we see both.
+        # This keeps planned qty / level maps stable even when subsequent events omit clientOrderId.
+        if order_ref is not None and client_ref is not None:
+            try:
+                order_ref_s = str(order_ref).strip()
+                client_ref_s = str(client_ref).strip()
+                if order_ref_s and client_ref_s:
+                    if order_ref_s not in self._planned_qty_by_order_ref:
+                        planned_from_client = self._planned_qty_by_order_ref.get(client_ref_s)
+                        if planned_from_client is not None:
+                            planned_dec = _d(planned_from_client)
+                            if planned_dec > 0:
+                                self._planned_qty_by_order_ref[order_ref_s] = planned_dec
+                    if order_ref_s not in self._buy_level_by_order_ref:
+                        buy_lvl = self._buy_level_by_order_ref.get(client_ref_s)
+                        if buy_lvl is not None:
+                            self._buy_level_by_order_ref[order_ref_s] = _d(buy_lvl)
+                    if order_ref_s not in self._sell_level_by_order_ref:
+                        sell_lvl = self._sell_level_by_order_ref.get(client_ref_s)
+                        if sell_lvl is not None:
+                            self._sell_level_by_order_ref[order_ref_s] = _d(sell_lvl)
+            except Exception:
+                pass
         self._refresh_broker_state_after_fill(broker)
         
         # Normalize fill qty to exchange LOT_SIZE step to prevent SELL deadlocks
@@ -339,12 +389,20 @@ class GridBacktestAdapter:
             qty = _round_step(qty, self.step_size)
 
         # If a polling bridge replays a completed order fill and there is no stable exec id,
-        # do not let the strategy transition the same order twice.
+        # do not let the strategy transition the same EXCHANGE order twice.
+        # NOTE: do not dedupe by client_order_id; LOCAL-* ids can be reused after restarts.
         if order_ref is not None and str(order_ref) in self._finalized_fill_order_refs:
             return
 
         if qty <= 0 or px <= 0:
             return
+
+        fill_seen_ts = ts or self.last_quote_ts or datetime.now(timezone.utc)
+        if fill_seen_ts.tzinfo is None:
+            fill_seen_ts = fill_seen_ts.replace(tzinfo=timezone.utc)
+        else:
+            fill_seen_ts = fill_seen_ts.astimezone(timezone.utc)
+        self._last_fill_ts = fill_seen_ts
 
         # Dedupe repeated fill callbacks (reconnect/polling bridges may replay the same fill)
         exec_ref = self._fill_exec_ref(fill)
@@ -368,9 +426,11 @@ class GridBacktestAdapter:
             # until we have accumulated at least planned_qty (within one step).
             try:
                 planned_qty = self._planned_qty_by_order_ref.get(str(order_ref))
+                if (planned_qty is None or planned_qty <= 0) and client_ref is not None:
+                    planned_qty = self._planned_qty_by_order_ref.get(str(client_ref))
                 if planned_qty is not None and planned_qty > 0:
                     eps = self.step_size if self.step_size > 0 else Decimal("0")
-                    if is_final_fill and qty < (planned_qty - eps):
+                    if (not force_finalize) and is_final_fill and qty < (planned_qty - eps):
                         is_final_fill = False
             except Exception:
                 pass
@@ -381,13 +441,16 @@ class GridBacktestAdapter:
                     qty=qty,
                     px=px,
                     fee_quote=fee_quote,
-                    ts=ts,
+                    fee_base=fee_base,
+                    ts=fill_seen_ts,
                 )
                 current_added_to_acc = True
                 # If we know the planned qty for this order (captured on placement), we can
                 # finalize once accumulated qty reaches planned qty (within one step).
                 try:
                     planned_qty = self._planned_qty_by_order_ref.get(str(order_ref))
+                    if (planned_qty is None or planned_qty <= 0) and client_ref is not None:
+                        planned_qty = self._planned_qty_by_order_ref.get(str(client_ref))
                     if planned_qty is not None:
                         acc_now = self._fill_accum_by_order_ref.get(str(order_ref)) or {}
                         acc_qty_now = _d(acc_now.get("qty", 0))
@@ -405,7 +468,32 @@ class GridBacktestAdapter:
                 if not is_final_fill:
                     if self._broker_order_ref_is_open(broker, order_ref):
                         return
-                    # Order disappeared from open orders -> finalize using accumulated qty
+                    # Order disappeared from open orders. If we still have less than planned qty,
+                    # keep accumulator for a short grace window to collect late fragments from polling.
+                    try:
+                        planned_qty = self._planned_qty_by_order_ref.get(str(order_ref))
+                        if (planned_qty is None or planned_qty <= 0) and client_ref is not None:
+                            planned_qty = self._planned_qty_by_order_ref.get(str(client_ref))
+                        acc_now = self._fill_accum_by_order_ref.get(str(order_ref)) or {}
+                        acc_qty_now = _d(acc_now.get("qty", 0))
+                        eps = self.step_size if self.step_size > 0 else Decimal("0")
+                        if (
+                            (not force_finalize)
+                            and planned_qty is not None
+                            and planned_qty > 0
+                            and acc_qty_now < (planned_qty - eps)
+                        ):
+                            logger.debug(
+                                "GRID_FILL wait_more_fragments | side={} order_ref={} acc_qty={} planned_qty={} reason=order_closed_snapshot",
+                                side,
+                                order_ref,
+                                acc_qty_now,
+                                planned_qty,
+                            )
+                            return
+                    except Exception:
+                        pass
+                    # Enough qty accumulated (or forced) -> finalize now.
                     is_final_fill = True
 
             try:
@@ -416,7 +504,11 @@ class GridBacktestAdapter:
                         order_ref,
                         qty,
                         px,
-                        self._planned_qty_by_order_ref.get(str(order_ref)),
+                        (
+                            self._planned_qty_by_order_ref.get(str(order_ref))
+                            if self._planned_qty_by_order_ref.get(str(order_ref)) is not None
+                            else self._planned_qty_by_order_ref.get(str(client_ref)) if client_ref is not None else None
+                        ),
                     )
             except Exception:
                 pass
@@ -426,12 +518,14 @@ class GridBacktestAdapter:
                 if acc_qty > 0:
                     acc_quote = _d(acc.get("quote_sum", 0))
                     acc_fee = _d(acc.get("fee_quote", 0))
+                    acc_fee_base = _d(acc.get("fee_base", 0))
 
                     if current_added_to_acc:
                         # current fragment already included in accumulator
                         qty = acc_qty
                         px = (acc_quote / acc_qty) if acc_qty > 0 else px
                         fee_quote = acc_fee
+                        fee_base = acc_fee_base
                     else:
                         # accumulator has only previous fragments, add current now
                         curr_quote = qty * px
@@ -440,6 +534,7 @@ class GridBacktestAdapter:
                         qty = total_qty
                         px = (total_quote / total_qty) if total_qty > 0 else px
                         fee_quote = acc_fee + fee_quote
+                        fee_base = acc_fee_base + fee_base
 
                     acc_ts = acc.get("ts")
                     if ts is None and acc_ts is not None:
@@ -449,6 +544,8 @@ class GridBacktestAdapter:
                 self._finalized_fill_order_refs.add(str(order_ref))
                 # Order is finalized -> planned qty no longer needed.
                 self._planned_qty_by_order_ref.pop(str(order_ref), None)
+                if client_ref is not None:
+                    self._planned_qty_by_order_ref.pop(str(client_ref), None)
 
         self._notify_execution_fill(fill)
         # Pull freshest broker snapshot before processing the fill. In demo/live mode
@@ -461,20 +558,29 @@ class GridBacktestAdapter:
             buy_level = None
 
             # Prefer stable mapping by broker order id/client order id
-            if order_ref is not None:
-                buy_level = self._buy_level_by_order_ref.get(order_ref)
+            for ref in (order_ref, client_ref):
+                if ref is None:
+                    continue
+                buy_level = self._buy_level_by_order_ref.get(ref)
+                if buy_level is not None:
+                    break
 
-            # Fallback to nearest pending level
             if buy_level is None:
-                buy_level = self._peek_nearest_pending(self.pending_buy_levels, px)
-
-            if buy_level is None:
+                # Do not infer BUY level from pending ladder here:
+                # after restarts LOCAL-* client ids can be reused and pending maps can be stale,
+                # which may map a fill to a wrong level and collapse many lots to one sell price.
                 buy_level = px / (Decimal("1") + self.slippage_pct) if self.slippage_pct > 0 else px
 
             # Remove pending only on final fill state (keep mapping for partials)
-            if order_ref is None or str(order_ref) in self._finalized_fill_order_refs:
-                if order_ref is not None:
-                    self._buy_level_by_order_ref.pop(order_ref, None)
+            final_seen = False
+            for ref in (order_ref, client_ref):
+                if ref is not None and str(ref) in self._finalized_fill_order_refs:
+                    final_seen = True
+                    break
+            if order_ref is None or final_seen:
+                for ref in (order_ref, client_ref):
+                    if ref is not None:
+                        self._buy_level_by_order_ref.pop(ref, None)
 
                 # pop exact key by price if possible, otherwise nearest
                 buy_key = self._k(buy_level)
@@ -484,10 +590,26 @@ class GridBacktestAdapter:
                     self._pop_nearest_pending(self.pending_buy_levels, px)
             expected_sell_level = buy_level * (Decimal("1") + self.grid_step_pct)
 
-            # IMPORTANT:
-            # On Binance spot, commission is taken from QUOTE (or separate commission asset),
-            # so base qty received equals executed qty. Do NOT shrink base qty by maker_fee_rate.
+            # If commission is charged in base asset (common for BUY when no BNB discount),
+            # actual credited base is less than executed qty by `fee_base`.
+            if fee_base > 0:
+                qty -= fee_base
+                if qty < 0:
+                    qty = Decimal("0")
+
             qty = _round_step(qty, self.step_size) if self.step_size > 0 else qty
+            if qty <= 0:
+                logger.warning(
+                    "GRID_FILL buy_skip_after_base_fee | symbol={} order_ref={} px={} fee_base={}",
+                    self.symbol,
+                    order_ref,
+                    px,
+                    fee_base,
+                )
+                self._refresh_broker_state_after_fill(broker)
+                self._sync_broker_orders(broker)
+                self._update_drawdown(broker)
+                return
             self._lot_open_ts_by_key[self._lot_key(expected_sell_level, qty)] = ts
 
             # use qty_net everywhere дальше (и в lot_key тоже!)
@@ -506,20 +628,28 @@ class GridBacktestAdapter:
             sell_level = None
 
             # Prefer stable mapping by broker order id/client order id
-            if order_ref is not None:
-                sell_level = self._sell_level_by_order_ref.get(order_ref)
+            for ref in (order_ref, client_ref):
+                if ref is None:
+                    continue
+                sell_level = self._sell_level_by_order_ref.get(ref)
+                if sell_level is not None:
+                    break
 
-            # Fallback to nearest pending level
             if sell_level is None:
-                sell_level = self._peek_nearest_pending(self.pending_sell_levels, px)
-
-            if sell_level is None:
+                # Same rationale as BUY fallback above: prefer fill-derived level over
+                # potentially stale pending maps to avoid mismatched lot attribution.
                 sell_level = px / (Decimal("1") - self.slippage_pct) if self.slippage_pct > 0 else px
 
             # Remove pending only on final fill state (keep mapping for partials)
-            if order_ref is None or str(order_ref) in self._finalized_fill_order_refs:
-                if order_ref is not None:
-                    self._sell_level_by_order_ref.pop(order_ref, None)
+            final_seen = False
+            for ref in (order_ref, client_ref):
+                if ref is not None and str(ref) in self._finalized_fill_order_refs:
+                    final_seen = True
+                    break
+            if order_ref is None or final_seen:
+                for ref in (order_ref, client_ref):
+                    if ref is not None:
+                        self._sell_level_by_order_ref.pop(ref, None)
 
                 # SELL pending keys are composite "price|open_seq", so remove nearest
                 self._pop_nearest_pending(self.pending_sell_levels, px)
@@ -533,31 +663,45 @@ class GridBacktestAdapter:
                 self._update_drawdown(broker)
                 return
 
-            lot_key_to_remove = None
-            for lot in self._core.state.open_lots:
-                if lot.qty == qty:
-                    lot_key_to_remove = self._lot_key(lot.sell_price, lot.qty)
-                    break
-            if lot_key_to_remove is None and self._core.state.open_lots:
-                nearest_lot = min(self._core.state.open_lots, key=lambda x: abs(x.qty - qty))
-                lot_key_to_remove = self._lot_key(nearest_lot.sell_price, nearest_lot.qty)
-            if lot_key_to_remove is not None:
-                self._lot_open_ts_by_key.pop(lot_key_to_remove, None)
-            self._core.on_sell_fill(qty=qty, price=px, fee_quote=fee_quote)
+            self._core.on_sell_fill(qty=qty, price=px, fee_quote=fee_quote, level_price=sell_level)
             self.fills_sell += 1
             self._mirror_local_state_from_core()
             self._ensure_buy_ladder()
-
-            if self.year_end_liquidation_active:
-                base_after_sell = self._broker_base_qty(broker)
-                if base_after_sell <= 0:
-                    self.year_end_liquidation_active = False
-                    self.year_end_liquidation_target_base_qty = Decimal("0")
 
         # Re-sync broker desired orders after any fill
         self._refresh_broker_state_after_fill(broker)
         self._sync_broker_orders(broker)
         self._update_drawdown(broker)
+
+    def on_cancel(self, broker: Any, order_id: Any = None, client_order_id: Any = None) -> None:
+        """Best-effort cleanup for canceled orders reported by runtime loop."""
+        refs: list[str] = []
+        for raw in (order_id, client_order_id):
+            if raw is None:
+                continue
+            s = str(raw).strip()
+            if s:
+                refs.append(s)
+        if not refs:
+            return
+
+        for ref in refs:
+            buy_px = self._buy_level_by_order_ref.pop(ref, None)
+            if buy_px is not None:
+                key = self._k(_round_tick(_d(buy_px), self.tick_size))
+                self.pending_buy_levels.pop(key, None)
+                self._pending_buy_seen_at.pop(key, None)
+                self._buy_reject_until_by_level.pop(key, None)
+
+            sell_px = self._sell_level_by_order_ref.pop(ref, None)
+            if sell_px is not None:
+                key = self._k(_round_tick(_d(sell_px), self.tick_size))
+                self.pending_sell_levels.pop(key, None)
+                self._pending_sell_seen_at.pop(key, None)
+                self._sell_replace_cooldown_until_by_key.pop(key, None)
+
+            self._planned_qty_by_order_ref.pop(ref, None)
+            self._fill_accum_by_order_ref.pop(ref, None)
 
     def _refresh_broker_state_after_fill(self, broker: Any) -> None:
         def _maybe_call(x: Any) -> None:
@@ -602,6 +746,12 @@ class GridBacktestAdapter:
         if not self._fill_accum_by_order_ref:
             return
 
+        now_ts = self.last_quote_ts or datetime.now(timezone.utc)
+        if now_ts.tzinfo is None:
+            now_ts = now_ts.replace(tzinfo=timezone.utc)
+        else:
+            now_ts = now_ts.astimezone(timezone.utc)
+
         # Идём по копии, потому что будем мутировать dict
         for order_ref, acc in list(self._fill_accum_by_order_ref.items()):
             try:
@@ -619,11 +769,38 @@ class GridBacktestAdapter:
                 qty = _d(acc.get("qty", 0))
                 quote_sum = _d(acc.get("quote_sum", 0))
                 fee_quote = _d(acc.get("fee_quote", 0))
+                fee_base = _d(acc.get("fee_base", 0))
                 ts = acc.get("ts")
 
                 if qty <= 0 or quote_sum <= 0:
                     self._fill_accum_by_order_ref.pop(order_ref, None)
                     continue
+
+                force_finalize = False
+                planned_qty = self._planned_qty_by_order_ref.get(order_ref_s)
+                eps = self.step_size if self.step_size > 0 else Decimal("0")
+                if planned_qty is not None and planned_qty > 0 and qty < (planned_qty - eps):
+                    age_sec = None
+                    try:
+                        acc_ts = ts if isinstance(ts, datetime) else None
+                        if acc_ts is not None:
+                            acc_utc = acc_ts if acc_ts.tzinfo is not None else acc_ts.replace(tzinfo=timezone.utc)
+                            age_sec = (now_ts - acc_utc).total_seconds()
+                    except Exception:
+                        age_sec = None
+
+                    grace_sec = int(getattr(self, "_fill_accum_finalize_grace_seconds", 3))
+                    if grace_sec > 0 and age_sec is not None and age_sec < grace_sec:
+                        continue
+                    force_finalize = True
+                    logger.warning(
+                        "GRID_FILL finalize_from_acc_partial | order_ref={} side={} acc_qty={} planned_qty={} age_s={} reason=grace_expired",
+                        order_ref_s,
+                        side,
+                        qty,
+                        planned_qty,
+                        age_sec,
+                    )
 
                 px = (quote_sum / qty) if qty > 0 else Decimal("0")
 
@@ -635,15 +812,17 @@ class GridBacktestAdapter:
                     "qty": str(qty),
                     "price": str(px),
                     "fee_quote": str(fee_quote),
+                    "fee_base": str(fee_base),
                     "ts": ts.isoformat() if isinstance(ts, datetime) else ts,
                     "order_id": order_ref_s,
                     "status": "FILLED",
                     "partial": False,
                     "trade_id": f"ACCUM-{order_ref_s}",
+                    "force_finalize": force_finalize,
                 }
                 logger.debug(
-                    "GRID_FILL finalize_from_acc | order_ref={} side={} qty={} px={} fee_quote={} reason=order_not_open",
-                    order_ref_s, side, qty, px, fee_quote
+                    "GRID_FILL finalize_from_acc | order_ref={} side={} qty={} px={} fee_quote={} fee_base={} reason=order_not_open",
+                    order_ref_s, side, qty, px, fee_quote, fee_base
                 )
                 # Прогоняем как финальный fill -> появится open_lot -> _sync_broker_orders поставит SELL
                 self.on_fill(broker, synth_fill)
@@ -660,7 +839,6 @@ class GridBacktestAdapter:
         mid = self.last_mid or Decimal("0")
         base_notional = base_qty * mid
         equity = quote_cash + base_notional
-        year_gate = self._year_end_profit_gate(broker, mark_price=mid)
         self._sync_fee_rates_from_runtime(broker)
 
         reserved_pending_buy_quote = self._reserved_quote_in_pending_buys(broker)
@@ -692,24 +870,9 @@ class GridBacktestAdapter:
             "base": base_qty,
             "base_notional": base_notional,
             "equity": equity,
-            "equity_liq_net": year_gate["equity_liq_net"],
-            "required_base_year_gate": year_gate["required_base"],
-            "profit_gate_year": year_gate["profit_gate"],
-            "retained_profit_base": self.retained_profit_base,
             "manual_deposits_total": self.manual_deposits_total,
-            "manual_withdrawals_total": self.manual_withdrawals_total,
             "core_initial_quote": _d(getattr(self._core.state, "initial_quote", Decimal("0"))),
             "core_deposits_total": _d(getattr(self._core.state, "deposits_total", Decimal("0"))),
-            "core_withdrawals_total": _d(getattr(self._core.state, "withdrawals_total", Decimal("0"))),
-            "pending_year_end_withdrawal": self.pending_year_end_withdrawal,
-            "pending_year_end_withdrawal_deadline_ts": self.pending_year_end_withdrawal_deadline_ts,
-            "pending_year_end_profit_quote": self.pending_year_end_profit_quote,
-            "pending_year_end_withdraw_quote": self.pending_year_end_withdraw_quote,
-            "pending_year_end_retain_quote": self.pending_year_end_retain_quote,
-            "pending_year_end_trigger_ts": self.pending_year_end_trigger_ts,
-            "year_end_liquidation_active": self.year_end_liquidation_active,
-            "year_end_liquidation_started_ts": self.year_end_liquidation_started_ts,
-            "year_end_liquidation_target_base_qty": self.year_end_liquidation_target_base_qty,
             "open_orders": self._broker_open_orders_count(broker),
             "broker_open_orders_total": self._broker_open_orders_count(broker),
             "strategy_open_orders": self._broker_strategy_open_orders_count(broker),
@@ -870,6 +1033,56 @@ class GridBacktestAdapter:
         self._mirror_local_state_from_core()
         self._ensure_buy_ladder()   
 
+    def _build_sell_targets_from_open_lots(self) -> list[tuple[Decimal, Decimal]]:
+        """Aggregate SELL intents by price so one level has one order with summed qty."""
+        buckets: dict[str, dict[str, Decimal]] = {}
+
+        for lot in sorted(self.open_lots, key=lambda x: (x.sell_price, x.open_seq)):
+            if lot.qty <= 0:
+                continue
+
+            sell_px_place = _round_tick(_d(lot.sell_price), self.tick_size)
+            if sell_px_place <= 0:
+                continue
+
+            lot_qty = _round_step(_d(lot.qty), self.step_size)
+            if lot_qty <= 0 or lot_qty < self.min_qty:
+                self.min_notional_blocked += 1
+                continue
+            if (lot_qty * sell_px_place) < self.min_notional:
+                self.min_notional_blocked += 1
+                continue
+
+            if self.grid_sell_only_above_cost:
+                proceeds_net = (lot_qty * sell_px_place) * (Decimal("1") - self.maker_fee_rate)
+                if proceeds_net <= lot.cost_quote:
+                    self.sell_profit_blocked += 1
+                    step_too_small = self.grid_step_pct <= (self.maker_fee_rate * Decimal("2"))
+                    if not step_too_small:
+                        continue
+
+            if self.grid_min_sell_markup_pct > 0:
+                if sell_px_place < lot.buy_price * (Decimal("1") + self.grid_min_sell_markup_pct):
+                    continue
+
+            key = self._k(sell_px_place)
+            bucket = buckets.get(key)
+            if bucket is None:
+                buckets[key] = {"price": sell_px_place, "qty": lot_qty}
+            else:
+                bucket["qty"] = bucket["qty"] + lot_qty
+
+        out: list[tuple[Decimal, Decimal]] = []
+        for key in sorted(buckets.keys(), key=lambda k: buckets[k]["price"]):
+            price = buckets[key]["price"]
+            qty = _round_step(_d(buckets[key]["qty"]), self.step_size)
+            if qty <= 0 or qty < self.min_qty:
+                continue
+            if (qty * price) < self.min_notional:
+                continue
+            out.append((price, qty))
+        return out
+
     def _sync_broker_orders(self, broker: Any) -> None:
         """Place desired levels as limit orders via broker.
 
@@ -888,29 +1101,81 @@ class GridBacktestAdapter:
                 len(self.open_lots),
             )
 
-        # Freeze normal grid order placement during year-end liquidation / withdrawal window.
-        if self.year_end_liquidation_active or self.pending_year_end_withdrawal:
-            logger.trace(
-                "GRID_SYNC skip frozen | symbol={} liquidation_active={} pending_year_end_withdrawal={}",
-                self.symbol,
-                self.year_end_liquidation_active,
-                self.pending_year_end_withdrawal,
-            )
-            return
-
         self._reconcile_pending_levels_from_broker(broker)
         self._ensure_buy_ladder()
-        broker_open_sigs = self._broker_open_order_sigs(broker)
+        desired_buy_keys_norm = {
+            self._k(_round_tick(_d(px), self.tick_size))
+            for px in self.buy_orders
+            if _round_tick(_d(px), self.tick_size) > 0
+        }
+        max_buy_cfg = max(int(getattr(self, "max_active_buy_orders", self.grid_n_buy)), 0)
+        self._enforce_buy_ladder_cap(
+            broker,
+            desired_buy_keys=desired_buy_keys_norm,
+            max_buy=max_buy_cfg,
+        )
         # Keep TOTAL active orders (BUY+SELL) capped.
-        # Desired SELL count is 1:1 with open lots. Remaining slots are used for BUY ladder.
+        # SELL side is aggregated by price level; remaining slots are used for BUY ladder.
         max_total = int(getattr(self, "max_total_orders", self.grid_n_buy))
         if max_total < 0:
             max_total = 0
 
-        desired_sell_cnt = len(self.open_lots)
+        sell_targets = self._build_sell_targets_from_open_lots()
+        desired_sell_cnt = len(sell_targets)
         desired_buy_cnt = max_total - desired_sell_cnt
         if desired_buy_cnt < 0:
             desired_buy_cnt = 0
+
+        # Cancel stale SELL orders that are no longer represented by current lot targets.
+        # Otherwise base can stay locked on orphan prices and block correct SELL placement.
+        desired_sell_keys = {self._k(px) for px, _ in sell_targets}
+        stale_sell_cancelled = 0
+        try:
+            for meta in self._broker_active_strategy_orders(broker):
+                if meta.get("side") != "SELL":
+                    continue
+                px = _d(meta.get("price", Decimal("0")))
+                if px <= 0:
+                    continue
+                key = self._k(px)
+                if key in desired_sell_keys:
+                    continue
+                oid_s = str(meta.get("order_id") or "").strip()
+                coid_s = str(meta.get("client_order_id") or "").strip()
+                if not self._cancel_order_refs_best_effort(broker, order_id=oid_s, client_order_id=coid_s):
+                    continue
+                stale_sell_cancelled += 1
+                self.pending_sell_levels.pop(key, None)
+                self._pending_sell_seen_at.pop(key, None)
+                self._sell_replace_cooldown_until_by_key.pop(key, None)
+                for ref in (oid_s, coid_s):
+                    if not ref:
+                        continue
+                    self._sell_level_by_order_ref.pop(ref, None)
+                    self._planned_qty_by_order_ref.pop(ref, None)
+                    self._fill_accum_by_order_ref.pop(ref, None)
+        except Exception:
+            pass
+        if stale_sell_cancelled > 0:
+            logger.warning(
+                "GRID_SYNC stale_sell_cleanup | symbol={} cancelled={} desired_sell_cnt={} open_lots={}",
+                self.symbol,
+                stale_sell_cancelled,
+                desired_sell_cnt,
+                len(self.open_lots),
+            )
+            self._refresh_broker_state_after_fill(broker)
+
+        # Priority rule: if slots are saturated while SELL exits are missing, trim extra BUYs first.
+        self._trim_buy_orders_for_sell_priority(
+            broker,
+            desired_sell_cnt=desired_sell_cnt,
+            max_total=max_total,
+        )
+        self._dedupe_duplicate_buy_prices(broker)
+        # Refresh local pending maps after potential cancellations.
+        self._reconcile_pending_levels_from_broker(broker)
+        broker_open_sig_counts = self._broker_open_order_sig_counts(broker)
 
         def _active_total_orders() -> int:
             """Best-effort count of currently active strategy orders (excluding LOCAL-*)"""
@@ -940,6 +1205,69 @@ class GridBacktestAdapter:
             self._broker_quote_cash(broker),
             self._broker_base_qty(broker),
         )
+        sync_now_ts = self.last_quote_ts or datetime.now(timezone.utc)
+        if sync_now_ts.tzinfo is None:
+            sync_now_ts = sync_now_ts.replace(tzinfo=timezone.utc)
+        else:
+            sync_now_ts = sync_now_ts.astimezone(timezone.utc)
+
+        # Release stale BUY pending keys that have no broker-visible order for too long.
+        # Without this, one stale key can block a full BUY slot and leave ladder underfilled.
+        stale_release_sec = int(getattr(self, "_pending_buy_stale_release_seconds", 12))
+        if stale_release_sec > 0 and self.pending_buy_levels:
+            broker_open_buy_keys: set[str] = set()
+            try:
+                for o in list(getattr(broker, "open_orders", []) or []):
+                    if not self._order_is_active(o):
+                        continue
+                    side = self._norm_side(_get(o, "side", default=None))
+                    if side != "BUY":
+                        continue
+                    status_raw = _get(o, "status", "state", default=None)
+                    if status_raw is not None:
+                        st = str(status_raw).upper()
+                        if st in {"FILLED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED", "CLOSED"}:
+                            continue
+                    px_raw = _get(o, "limit_price", "price", "limit", "px", default=None)
+                    if px_raw is None:
+                        continue
+                    px = _round_tick(_d(px_raw), self.tick_size)
+                    if px <= 0:
+                        continue
+                    broker_open_buy_keys.add(self._k(px))
+            except Exception:
+                broker_open_buy_keys = set()
+
+            released_pending = 0
+            for k in list(self.pending_buy_levels.keys()):
+                if k in broker_open_buy_keys:
+                    continue
+
+                seen_at = self._pending_buy_seen_at.get(k)
+                should_release = False
+                if seen_at is None:
+                    should_release = True
+                else:
+                    seen_utc = seen_at if seen_at.tzinfo is not None else seen_at.replace(tzinfo=timezone.utc)
+                    if (sync_now_ts - seen_utc).total_seconds() >= stale_release_sec:
+                        should_release = True
+
+                if not should_release:
+                    continue
+
+                self.pending_buy_levels.pop(k, None)
+                self._pending_buy_seen_at.pop(k, None)
+                self._buy_reject_until_by_level.pop(k, None)
+                released_pending += 1
+
+            if released_pending > 0:
+                logger.warning(
+                    "GRID_SYNC pending_buy_released | symbol={} released={} stale_after_s={} broker_open_buy={}",
+                    self.symbol,
+                    released_pending,
+                    stale_release_sec,
+                    len(broker_open_buy_keys),
+                )
 
         def _active_buy_slots_left() -> int:
             """How many BUY orders we can still place this tick."""
@@ -974,174 +1302,165 @@ class GridBacktestAdapter:
             )
             return left if left > 0 else 0
 
+        def _free_base_for_new_sells() -> Decimal:
+            try:
+                base_total_now = _d(self._broker_base_total(broker))
+            except Exception:
+                base_total_now = Decimal("0")
+            try:
+                reserved_now = _d(self._reserved_base_in_open_sells(broker))
+            except Exception:
+                reserved_now = Decimal("0")
+            free_now = base_total_now - reserved_now
+            if free_now < 0:
+                free_now = Decimal("0")
+            if self.step_size and self.step_size > 0:
+                free_now = _round_step(free_now, self.step_size)
+            return free_now
+
         
 
-        # 1) Ensure SELLs for all open lots
-        for lot in sorted(self.open_lots, key=lambda x: x.sell_price):
-            if lot.qty <= 0:
-                continue
+        # 1) Ensure SELLs for aggregated open-lot targets (one order per price level).
+        active_sells_by_price: dict[str, list[dict[str, Any]]] = {}
+        try:
+            for meta in self._broker_active_strategy_orders(broker):
+                if meta.get("side") != "SELL":
+                    continue
+                px = _d(meta.get("price", Decimal("0")))
+                if px <= 0:
+                    continue
+                active_sells_by_price.setdefault(self._k(px), []).append(meta)
+        except Exception:
+            active_sells_by_price = {}
 
-            # Normalize SELL price to tick size once, then use consistently.
-            sell_px_place = _round_tick(_d(lot.sell_price), self.tick_size)
-            if sell_px_place <= 0:
-                continue
+        eps = (self.step_size * Decimal("2")) if self.step_size and self.step_size > 0 else Decimal("0")
 
-            if lot.qty < self.min_qty:
+        for sell_px_place, sell_qty in sell_targets:
+            if sell_qty <= 0:
+                continue
+            if sell_qty < self.min_qty:
                 self.min_notional_blocked += 1
                 continue
-            if (lot.qty * sell_px_place) < self.min_notional:
-                self.min_notional_blocked += 1
-                continue
-            if self.grid_sell_only_above_cost:
-                # NOTE: with very small `grid_step_pct`, proceeds after fees can be <= cost_quote.
-                # If we block sells in that configuration, the strategy accumulates base without ever
-                # placing exits. So we only enforce the below-cost guard when the configured step is
-                # reasonably above fee drag; otherwise we allow the SELL to be placed.
-                proceeds_net = (lot.qty * sell_px_place) * (Decimal("1") - self.maker_fee_rate)
-                if proceeds_net <= lot.cost_quote:
-                    self.sell_profit_blocked += 1
-                    step_too_small = self.grid_step_pct <= (self.maker_fee_rate * Decimal("2"))
-                    if step_too_small:
-                        logger.debug(
-                            "GRID_PLACE allow | side=SELL px={} qty={} proceeds_net={} cost_quote={} step_pct={} fee={} reason=below_cost_but_step_too_small",
-                            sell_px_place,
-                            lot.qty,
-                            proceeds_net,
-                            lot.cost_quote,
-                            self.grid_step_pct,
-                            self.maker_fee_rate,
-                        )
-                    else:
-                        logger.debug(
-                            "GRID_PLACE skip | side=SELL px={} qty={} proceeds_net={} cost_quote={} step_pct={} fee={} reason=below_cost",
-                            sell_px_place,
-                            lot.qty,
-                            proceeds_net,
-                            lot.cost_quote,
-                            self.grid_step_pct,
-                            self.maker_fee_rate,
-                        )
-                        continue
-            if self.grid_min_sell_markup_pct > 0:
-                if sell_px_place < lot.buy_price * (Decimal("1") + self.grid_min_sell_markup_pct):
-                    continue
-
-            # SELL must be placed only for the FULL lot qty.
-            # If broker balances are stale right after a BUY fill, we still want to place the full SELL.
-            # So we compute base_free = base_total - reserved_in_open_sells, but if snapshot looks stale
-            # versus strategy lots, we allow placement for the full lot qty (exchange-side validation still protects).
-            target_sell_qty = _round_step(_d(lot.qty), self.step_size)
-            if target_sell_qty <= 0 or target_sell_qty < self.min_qty:
-                logger.debug(
-                    "GRID_PLACE skip | side=SELL px={} lot_qty={} target_sell_qty={} reason=min_qty_or_zero",
-                    sell_px_place,
-                    lot.qty,
-                    target_sell_qty,
-                )
-                continue
-
-            # Broker base snapshot can lag right after a BUY fill; compute free base net of already-open SELLs.
-            base_total = _round_step(self._broker_base_total(broker), self.step_size)
-            base_reserved = Decimal("0")
-            try:
-                base_reserved = _round_step(self._reserved_base_in_open_sells(broker), self.step_size)
-            except Exception:
-                base_reserved = Decimal("0")
-
-            base_free = base_total - base_reserved
-            if base_free < 0:
-                base_free = Decimal("0")
-
-            eps = (self.step_size * Decimal("2")) if self.step_size and self.step_size > 0 else Decimal("0")
-
-            # We want to place FULL-lot SELLs whenever possible.
-            # Brokers may clamp qty to currently free base. Allow full-lot if ANY reasonable snapshot says qty is available.
-            strategy_open_base = Decimal("0")
-            try:
-                for _lot in self.open_lots:
-                    strategy_open_base += _d(getattr(_lot, "qty", 0))
-            except Exception:
-                strategy_open_base = Decimal("0")
-
-            if (base_free + eps) < target_sell_qty:
-                if (base_total + eps) >= target_sell_qty:
-                    # reserved calc may be off -> allow full-lot
-                    base_free = target_sell_qty
-                elif (strategy_open_base + eps) >= target_sell_qty:
-                    # balances snapshot likely stale -> allow full-lot
-                    base_free = target_sell_qty
-                else:
-                    # Not enough base anywhere -> skip (otherwise broker will clamp)
-                    continue
-
-            # Strict mode: never place partial sells.
-            # However, right after a BUY fill in demo/live polling mode, broker balances can be stale
-            # (base_total still shows the old value). If strategy lots clearly imply more base than
-            # broker reports, treat snapshot as stale and allow placing the FULL lot SELL.
-            if base_free < target_sell_qty:
-                stale_balance_snapshot = strategy_open_base > (base_total + eps)
-
-                if stale_balance_snapshot and strategy_open_base >= target_sell_qty:
-                    logger.debug(
-                        "GRID_PLACE allow | side=SELL px={} lot_qty={} base_total={} base_reserved={} base_free={} strategy_open_base={} reason=stale_balance_snapshot",
-                        sell_px_place, lot.qty, base_total, base_reserved, base_free, strategy_open_base,
-                    )
-                else:
-                    logger.debug(
-                        "GRID_PLACE skip | side=SELL px={} lot_qty={} base_total={} base_reserved={} base_free={} strategy_open_base={} reason=insufficient_free_base_for_full_lot",
-                        sell_px_place, lot.qty, base_total, base_reserved, base_free, strategy_open_base,
-                    )
-                    continue
-
-                if stale_balance_snapshot and strategy_open_base >= target_sell_qty:
-                    logger.debug(
-                        "GRID_PLACE allow | side=SELL px={} lot_qty={} base_total={} base_reserved={} base_free={} strategy_open_base={} reason=stale_balance_snapshot",
-                        sell_px_place,
-                        lot.qty,
-                        base_total,
-                        base_reserved,
-                        base_free,
-                        strategy_open_base,
-                    )
-                else:
-                    logger.debug(
-                        "GRID_PLACE skip | side=SELL px={} lot_qty={} base_total={} base_reserved={} base_free={} strategy_open_base={} reason=insufficient_free_base_for_full_lot",
-                        sell_px_place,
-                        lot.qty,
-                        base_total,
-                        base_reserved,
-                        base_free,
-                        strategy_open_base,
-                    )
-                    continue
-
-            sell_qty = target_sell_qty
             if (sell_qty * sell_px_place) < self.min_notional:
                 self.min_notional_blocked += 1
                 continue
 
-            key = f"{self._k(sell_px_place)}|{lot.open_seq}"            
-            if key in self.pending_sell_levels:
+            key = self._k(sell_px_place)
+            existing = active_sells_by_price.get(key, [])
+            existing_qty = Decimal("0")
+            for row in existing:
+                existing_qty += _d(row.get("qty", Decimal("0")))
+
+            # If there is no visible SELL on this level and free base is currently below
+            # full target qty, skip placement now. This avoids partial/duplicate churn while
+            # broker snapshots converge after recent fills/cancels.
+            if not existing:
+                free_now = _free_base_for_new_sells()
+                if free_now + eps < sell_qty:
+                    self.pending_sell_levels[key] = sell_px_place
+                    self._pending_sell_seen_at[key] = sync_now_ts
+                    continue
+
+            qty_delta = sell_qty - existing_qty
+            tiny_unsellable_gap = False
+            if qty_delta > 0:
+                gap_qty = _round_step(qty_delta, self.step_size) if self.step_size > 0 else qty_delta
+                if gap_qty <= 0:
+                    tiny_unsellable_gap = True
+                elif self.min_qty > 0 and gap_qty < self.min_qty:
+                    tiny_unsellable_gap = True
+                elif self.min_notional > 0 and (gap_qty * sell_px_place) < self.min_notional:
+                    tiny_unsellable_gap = True
+
+            # If we still have only local pending marker and broker snapshot has no SELL row yet,
+            # avoid duplicate placement in this sync pass.
+            if key in self.pending_sell_levels and not existing:
                 self.duplicate_pending_skips += 1
                 self.duplicate_place_skips += 1
                 if (self.duplicate_pending_skips - self._dup_skip_log_last_sell) >= self._dup_skip_log_every:
                     self._dup_skip_log_last_sell = self.duplicate_pending_skips
                     logger.debug(
-                        "GRID_PLACE skip summary | side=SELL reason=pending_duplicate total_dup_pending={} total_dup_place={} open_lots={} pending_sell={}",
+                        "GRID_PLACE skip summary | side=SELL reason=pending_duplicate total_dup_pending={} total_dup_place={} sell_targets={} pending_sell={}",
                         self.duplicate_pending_skips,
                         self.duplicate_place_skips,
-                        len(self.open_lots),
+                        len(sell_targets),
                         len(self.pending_sell_levels),
                     )
                 continue
-            # place SELL only when not already market far-through (broker may instantly fill if marketable)
-            # Enforce total order cap: SELLs have priority, but do not exceed max_total.
-            sell_sig = self._order_sig("SELL", sell_qty, sell_px_place)
-            if sell_sig in broker_open_sigs:
+
+            # One exact active SELL at this price means level is already covered.
+            if len(existing) == 1 and (abs(existing_qty - sell_qty) <= eps or tiny_unsellable_gap):
                 self.pending_sell_levels[key] = sell_px_place
+                self._pending_sell_seen_at[key] = sync_now_ts
+                self._sell_replace_cooldown_until_by_key.pop(key, None)
                 continue
-            if _total_slots_left() <= 0:
-                break
+
+            # Rebuild any ambiguous SELL set on this price:
+            # - quantity mismatch
+            # - multiple active rows on one grid level (duplicates)
+            if existing and (len(existing) > 1 or abs(existing_qty - sell_qty) > eps):
+                # If existing SELL qty is below target but there is not enough currently free base
+                # to top up this level, keep current order and wait for snapshots/fills to converge.
+                if existing_qty < sell_qty:
+                    needed = sell_qty - existing_qty
+                    free_now = _free_base_for_new_sells()
+                    if free_now + eps < needed:
+                        self.pending_sell_levels[key] = sell_px_place
+                        self._pending_sell_seen_at[key] = sync_now_ts
+                        continue
+
+                cooldown_until = self._sell_replace_cooldown_until_by_key.get(key)
+                if cooldown_until is not None:
+                    cooldown_utc = cooldown_until if cooldown_until.tzinfo is not None else cooldown_until.replace(tzinfo=timezone.utc)
+                    if sync_now_ts < cooldown_utc:
+                        continue
+                    self._sell_replace_cooldown_until_by_key.pop(key, None)
+
+                cancelled_here = 0
+                for meta in existing:
+                    oid_s = str(meta.get("order_id") or "").strip()
+                    coid_s = str(meta.get("client_order_id") or "").strip()
+                    if self._cancel_order_refs_best_effort(broker, order_id=oid_s, client_order_id=coid_s):
+                        cancelled_here += 1
+                    for ref in (oid_s, coid_s):
+                        if not ref:
+                            continue
+                        self._sell_level_by_order_ref.pop(ref, None)
+                        self._planned_qty_by_order_ref.pop(ref, None)
+                        self._fill_accum_by_order_ref.pop(ref, None)
+                if cancelled_here > 0:
+                    logger.warning(
+                        "GRID_SYNC sell_price_replace | symbol={} px={} cancelled={} existing_qty={} target_qty={} reason={}",
+                        self.symbol,
+                        sell_px_place,
+                        cancelled_here,
+                        existing_qty,
+                        sell_qty,
+                        ("duplicate_rows" if len(existing) > 1 else "qty_mismatch"),
+                    )
+
+                # Do not place replacement in the same sync pass:
+                # broker cancels are async and balance/order snapshots may still be stale.
+                # Keep this level pending and retry on a later tick after a short cooldown.
+                self.pending_sell_levels[key] = sell_px_place
+                self._pending_sell_seen_at[key] = sync_now_ts
+                retry_cooldown_sec = int(getattr(self, "_sell_replace_retry_cooldown_seconds", 5))
+                if retry_cooldown_sec > 0:
+                    self._sell_replace_cooldown_until_by_key[key] = sync_now_ts + timedelta(seconds=retry_cooldown_sec)
+                else:
+                    self._sell_replace_cooldown_until_by_key.pop(key, None)
+                active_sells_by_price.pop(key, None)
+                continue
+
+            # If exact signature is present, reuse it and avoid duplicate placement.
+            sell_sig = self._order_sig("SELL", sell_qty, sell_px_place)
+            if broker_open_sig_counts.get(sell_sig, 0) > 0:
+                broker_open_sig_counts[sell_sig] = int(broker_open_sig_counts.get(sell_sig, 0)) - 1
+                self.pending_sell_levels[key] = sell_px_place
+                self._pending_sell_seen_at[key] = sync_now_ts
+                self._sell_replace_cooldown_until_by_key.pop(key, None)
+                continue
+
             logger.trace(
                 "GRID_PLACE try | side=SELL px={} qty={} notional={} key={}",
                 sell_px_place,
@@ -1158,13 +1477,14 @@ class GridBacktestAdapter:
             )
             if ok:
                 self.pending_sell_levels[key] = sell_px_place
-                self._refresh_broker_state_after_fill(broker)    
+                self._pending_sell_seen_at[key] = sync_now_ts
+                self._sell_replace_cooldown_until_by_key.pop(key, None)
+                self._refresh_broker_state_after_fill(broker)
             else:
                 logger.warning(
-                    "GRID_PLACE failed | side=SELL px={} qty={} lot_qty={} free_base={} err={}",
+                    "GRID_PLACE failed | side=SELL px={} qty={} free_base={} err={}",
                     sell_px_place,
                     sell_qty,
-                    lot.qty,
                     self._broker_base_qty(broker),
                     self._last_place_limit_error,
                 )
@@ -1173,6 +1493,56 @@ class GridBacktestAdapter:
         # (SELL exits above were handled already.)
         if self.last_bid is None or self.last_ask is None:
             return
+
+        # Freeze BUY ladder while strategy-tracked base is not fully covered by open SELL orders.
+        try:
+            tracked_open_base = Decimal("0")
+            for lot in self.open_lots:
+                try:
+                    tracked_open_base += _d(getattr(lot, "qty", 0))
+                except Exception:
+                    continue
+            base_total_now = _round_step(tracked_open_base, self.step_size) if self.step_size > 0 else tracked_open_base
+            reserved_sell_now = _round_step(self._reserved_base_in_open_sells(broker), self.step_size) if self.step_size > 0 else _d(self._reserved_base_in_open_sells(broker))
+            uncovered_base = base_total_now - reserved_sell_now
+            if uncovered_base > eps:
+                # Do not freeze BUY ladder on unsellable base dust:
+                # if uncovered base cannot pass exchange SELL filters (min_qty/min_notional),
+                # blocking BUYs would deadlock the grid with no actionable exit.
+                uncovered_for_check = _round_step(uncovered_base, self.step_size) if self.step_size > 0 else uncovered_base
+                sell_ref_px = self.last_bid if (self.last_bid is not None and self.last_bid > 0) else (self.last_mid or Decimal("0"))
+                dust_unsellable = False
+                if uncovered_for_check <= 0:
+                    dust_unsellable = True
+                elif self.min_qty > 0 and uncovered_for_check < self.min_qty:
+                    dust_unsellable = True
+                elif sell_ref_px > 0 and self.min_notional > 0 and (uncovered_for_check * sell_ref_px) < self.min_notional:
+                    dust_unsellable = True
+
+                if not dust_unsellable:
+                    now_ts = sync_now_ts
+                    last_ts = self._last_buy_freeze_log_ts
+                    should_log = False
+                    if last_ts is None:
+                        should_log = True
+                    else:
+                        last_utc = last_ts if last_ts.tzinfo is not None else last_ts.replace(tzinfo=timezone.utc)
+                        if (now_ts - last_utc).total_seconds() >= int(getattr(self, "_buy_freeze_log_every_seconds", 5)):
+                            should_log = True
+
+                    if should_log:
+                        self._last_buy_freeze_log_ts = now_ts
+                        logger.warning(
+                            "GRID_SYNC buy_freeze | symbol={} uncovered_base={} base_total={} reserved_sell={} sell_targets={}",
+                            self.symbol,
+                            uncovered_base,
+                            base_total_now,
+                            reserved_sell_now,
+                            len(sell_targets),
+                        )
+                    return
+        except Exception:
+            pass
 
         # 2) Ensure BUY ladder
         buy_levels_sorted = sorted(self.buy_orders, reverse=True)
@@ -1186,8 +1556,12 @@ class GridBacktestAdapter:
             bp_place = _round_tick(_d(bp), self.tick_size)
             if bp_place <= 0:
                 continue
-            # Spend is ALWAYS a fraction of TOTAL capital (equity), not free quote.
-            spend_target = self._resolve_spend_quote(broker)
+            # Spend is a fraction of total equity, but it must gracefully degrade
+            # to currently placeable cash and remaining BUY slots.
+            spend_target = self._resolve_spend_quote(
+                broker,
+                desired_orders=max(1, _active_buy_slots_left()),
+            )
 
             # If target spend is non-positive -> no order.
             if spend_target <= 0:
@@ -1266,7 +1640,8 @@ class GridBacktestAdapter:
                 self._buy_reject_until_by_level.pop(key, None)
 
             buy_sig = self._order_sig("BUY", qty, bp_place)
-            if buy_sig in broker_open_sigs:
+            if broker_open_sig_counts.get(buy_sig, 0) > 0:
+                broker_open_sig_counts[buy_sig] = int(broker_open_sig_counts.get(buy_sig, 0)) - 1
                 self.pending_buy_levels[key] = bp_place
                 continue
 
@@ -1320,6 +1695,281 @@ class GridBacktestAdapter:
 
         self._core.state.quote = quote_cash
         self._core.state.base = base_qty
+
+    def _drop_excess_open_lots_from_base(self, broker: Any) -> None:
+        """Drop stale strategy lots when tracked base exceeds broker base snapshot.
+
+        This can happen when SELL fills were missed during restart/startup sync:
+        strategy still thinks lots are open, but wallet base is already gone.
+        """
+        lots = list(self._core.state.open_lots or [])
+        if not lots:
+            self._drop_excess_candidate_since = None
+            return
+
+        eps = self.step_size if self.step_size and self.step_size > 0 else Decimal("0")
+        tolerance = (eps * Decimal("2")) if eps > 0 else Decimal("0")
+
+        now_ts = self.last_quote_ts or datetime.now(timezone.utc)
+        if now_ts.tzinfo is None:
+            now_ts = now_ts.replace(tzinfo=timezone.utc)
+        else:
+            now_ts = now_ts.astimezone(timezone.utc)
+
+        # Don't trim lots while partial fill accumulators are active.
+        if self._fill_accum_by_order_ref:
+            return
+
+        # Cooldown after any fill: wallet/base snapshots can be stale for several seconds.
+        last_fill_ts = self._last_fill_ts
+        if last_fill_ts is not None:
+            last_fill_utc = last_fill_ts if last_fill_ts.tzinfo is not None else last_fill_ts.replace(tzinfo=timezone.utc)
+            cooldown_sec = int(getattr(self, "_drop_excess_cooldown_after_fill_seconds", 15))
+            if cooldown_sec > 0 and (now_ts - last_fill_utc).total_seconds() < cooldown_sec:
+                return
+
+        base_total_raw = self._broker_base_total(broker)
+        base_total = _round_step(_d(base_total_raw), self.step_size) if eps > 0 else _d(base_total_raw)
+        if base_total < 0:
+            base_total = Decimal("0")
+
+        tracked_open_base = Decimal("0")
+        for lot in lots:
+            try:
+                tracked_open_base += _d(getattr(lot, "qty", 0))
+            except Exception:
+                continue
+        if eps > 0:
+            tracked_open_base = _round_step(tracked_open_base, self.step_size)
+
+        if tracked_open_base <= (base_total + tolerance):
+            self._drop_excess_candidate_since = None
+            return
+
+        # Require mismatch to persist for a short period before trimming lots.
+        candidate_since = self._drop_excess_candidate_since
+        if candidate_since is None:
+            self._drop_excess_candidate_since = now_ts
+            return
+
+        candidate_utc = candidate_since if candidate_since.tzinfo is not None else candidate_since.replace(tzinfo=timezone.utc)
+        confirm_sec = int(getattr(self, "_drop_excess_confirm_seconds", 8))
+        if confirm_sec > 0 and (now_ts - candidate_utc).total_seconds() < confirm_sec:
+            return
+
+        excess = tracked_open_base - base_total
+        removed_lots = 0
+        reduced_lots = 0
+        trimmed_qty = Decimal("0")
+
+        # Newest lots are more likely to be stale after restart gaps.
+        for idx in range(len(self._core.state.open_lots) - 1, -1, -1):
+            if excess <= tolerance:
+                break
+
+            lot = self._core.state.open_lots[idx]
+            lot_qty = _d(getattr(lot, "qty", 0))
+            if lot_qty <= 0:
+                continue
+
+            if lot_qty <= (excess + tolerance):
+                trimmed_qty += lot_qty
+                excess -= lot_qty
+                removed_lots += 1
+                self._core.state.open_lots.pop(idx)
+                continue
+
+            new_qty = lot_qty - excess
+            if eps > 0:
+                new_qty = _round_step(new_qty, self.step_size)
+
+            if new_qty <= 0:
+                trimmed_qty += lot_qty
+                excess -= lot_qty
+                removed_lots += 1
+                self._core.state.open_lots.pop(idx)
+                continue
+
+            sold_part = lot_qty - new_qty
+            if sold_part <= 0:
+                continue
+
+            try:
+                lot.cost_quote = _d(getattr(lot, "cost_quote", Decimal("0"))) * (new_qty / lot_qty)
+            except Exception:
+                pass
+            lot.qty = new_qty
+            trimmed_qty += sold_part
+            excess -= sold_part
+            reduced_lots += 1
+
+        if removed_lots <= 0 and reduced_lots <= 0:
+            return
+
+        tracked_after = Decimal("0")
+        for lot in self._core.state.open_lots:
+            try:
+                tracked_after += _d(getattr(lot, "qty", 0))
+            except Exception:
+                continue
+        if eps > 0:
+            tracked_after = _round_step(tracked_after, self.step_size)
+
+        logger.warning(
+            "GRID_RECONCILE drop_excess_open_lots | symbol={} removed_lots={} reduced_lots={} trimmed_qty={} tracked_before={} tracked_after={} base_total={}",
+            self.symbol,
+            removed_lots,
+            reduced_lots,
+            trimmed_qty,
+            tracked_open_base,
+            tracked_after,
+            base_total,
+        )
+        self._drop_excess_candidate_since = None
+        self._mirror_local_state_from_core()
+        self._ensure_buy_ladder()
+
+    def _recover_missing_open_lots_from_base(self, broker: Any) -> None:
+        """Recover strategy lots when broker base is present but lots are missing.
+
+        This protects live/demo runs from prior desyncs where open lots were dropped
+        while base remained on the wallet, leaving the strategy with BUY-only ladder
+        and no SELL exits.
+        """
+        # Lot synthesis from wallet balances is risky (external/locked base, snapshot lag).
+        # Keep it fully opt-in.
+        if not bool(getattr(self, "_enable_runtime_lot_recovery", False)):
+            return
+
+        # Avoid racing with still-finalizing partial fills.
+        if self._fill_accum_by_order_ref:
+            return
+
+        now_ts = self.last_quote_ts or datetime.now(timezone.utc)
+        if now_ts.tzinfo is None:
+            now_ts = now_ts.replace(tzinfo=timezone.utc)
+        else:
+            now_ts = now_ts.astimezone(timezone.utc)
+
+        last_fill_ts = self._last_fill_ts
+        if last_fill_ts is not None:
+            last_fill_utc = last_fill_ts if last_fill_ts.tzinfo is not None else last_fill_ts.replace(tzinfo=timezone.utc)
+            cooldown_sec = int(getattr(self, "_lot_recovery_cooldown_after_fill_seconds", 30))
+            if cooldown_sec > 0 and (now_ts - last_fill_utc).total_seconds() < cooldown_sec:
+                return
+
+        if self.last_mid is None or self.last_mid <= 0:
+            return
+
+        quote_cash = self._broker_quote_cash(broker)
+        eps = self.step_size if self.step_size and self.step_size > 0 else Decimal("0")
+        base_total = _round_step(self._broker_base_total(broker), self.step_size) if eps > 0 else _d(self._broker_base_total(broker))
+        if base_total <= 0:
+            return
+
+        tracked_open_base = Decimal("0")
+        for lot in self._core.state.open_lots:
+            try:
+                tracked_open_base += _d(getattr(lot, "qty", 0))
+            except Exception:
+                continue
+        if eps > 0:
+            tracked_open_base = _round_step(tracked_open_base, self.step_size)
+
+        # If exchange already has active SELLs, do not synthesize new lots from that reserved base.
+        reserved_in_open_sells = Decimal("0")
+        try:
+            reserved_in_open_sells = self._reserved_base_in_open_sells(broker)
+            if eps > 0:
+                reserved_in_open_sells = _round_step(reserved_in_open_sells, self.step_size)
+        except Exception:
+            reserved_in_open_sells = Decimal("0")
+
+        # Untracked base on wallet (base not represented by strategy lots).
+        # If broker has orphan SELLs not linked to lots, their reserved qty should not be recovered.
+        orphan_reserved = reserved_in_open_sells - tracked_open_base
+        if orphan_reserved < 0:
+            orphan_reserved = Decimal("0")
+        recover_qty = base_total - tracked_open_base - orphan_reserved
+        if recover_qty <= (eps * Decimal("2") if eps > 0 else Decimal("0")):
+            return
+
+        ref_px = self.last_mid
+        est_buy_price = ref_px / (Decimal("1") + self.grid_step_pct) if self.grid_step_pct > 0 else ref_px
+        if est_buy_price <= 0:
+            return
+        est_sell_price = est_buy_price * (Decimal("1") + self.grid_step_pct)
+
+        qty_hint = self._resolve_spend_quote(broker) / ref_px if ref_px > 0 else Decimal("0")
+        if eps > 0:
+            qty_hint = _round_step(qty_hint, self.step_size)
+        if qty_hint <= 0:
+            qty_hint = recover_qty
+
+        max_lots = int(getattr(self, "max_total_orders", self.grid_n_buy))
+        if max_lots <= 0:
+            max_lots = 1
+        # If base is much larger than usual per-order size, distribute it across available slots
+        # so recovery can cover all base with at most `max_lots` SELL exits.
+        max_cover_with_hint = qty_hint * Decimal(max_lots)
+        if max_cover_with_hint > 0 and recover_qty > max_cover_with_hint:
+            qty_hint = recover_qty / Decimal(max_lots)
+            if eps > 0:
+                qty_hint = _round_step(qty_hint, self.step_size)
+            if qty_hint <= 0:
+                qty_hint = recover_qty
+
+        remaining = recover_qty
+        recovered = 0
+        while remaining > 0 and recovered < max_lots:
+            lot_qty = qty_hint if qty_hint > 0 else remaining
+            if lot_qty > remaining:
+                lot_qty = remaining
+            if eps > 0:
+                lot_qty = _round_step(lot_qty, self.step_size)
+            if lot_qty <= 0:
+                break
+
+            tail = remaining - lot_qty
+            if tail > 0 and tail < self.min_qty:
+                lot_qty = remaining
+                if eps > 0:
+                    lot_qty = _round_step(lot_qty, self.step_size)
+
+            if lot_qty < self.min_qty:
+                break
+            if (lot_qty * est_sell_price) < self.min_notional:
+                break
+
+            self._core.state.seq += 1
+            lot = GridLot(
+                buy_price=est_buy_price,
+                sell_price=est_sell_price,
+                qty=lot_qty,
+                cost_quote=(lot_qty * est_buy_price) * (Decimal("1") + self.maker_fee_rate),
+                open_seq=self._core.state.seq,
+            )
+            self._core.state.open_lots.append(lot)
+            self._lot_open_ts_by_key[self._lot_key(lot.sell_price, lot.qty)] = now_ts
+
+            recovered += 1
+            remaining -= lot_qty
+            if eps > 0:
+                remaining = _round_step(remaining, self.step_size)
+
+        if recovered > 0:
+            logger.warning(
+                "GRID_RECOVER synthesized_open_lots | symbol={} recovered_lots={} recovered_qty={} base_total={} tracked_open_base={} reserved_sell_base={} remaining_untracked_base={}",
+                self.symbol,
+                recovered,
+                (recover_qty - remaining),
+                base_total,
+                tracked_open_base,
+                reserved_in_open_sells,
+                remaining,
+            )
+            self._mirror_local_state_from_core()
+            self._ensure_buy_ladder()
 
         try:
             if hasattr(self._core.state, "initial_quote"):
@@ -1376,6 +2026,19 @@ class GridBacktestAdapter:
         s = str(raw).strip()
         return s or None
 
+    def _fill_client_ref(self, fill: Any) -> Optional[str]:
+        raw = _get(
+            fill,
+            "client_order_id",
+            "clientOrderId",
+            "origClientOrderId",
+            default=None,
+        )
+        if raw is None:
+            return None
+        s = str(raw).strip()
+        return s or None
+
     def _fill_exec_ref(self, fill: Any) -> Optional[str]:
         raw = _get(
             fill,
@@ -1403,6 +2066,7 @@ class GridBacktestAdapter:
         qty: Decimal,
         px: Decimal,
         fee_quote: Decimal,
+        fee_base: Decimal,
         ts: Optional[datetime],
     ) -> None:
         if qty <= 0 or px <= 0:
@@ -1415,6 +2079,7 @@ class GridBacktestAdapter:
                 "qty": qty,
                 "quote_sum": quote_sum,
                 "fee_quote": fee_quote,
+                "fee_base": fee_base,
                 "ts": ts,
             }
             return
@@ -1426,6 +2091,7 @@ class GridBacktestAdapter:
                 "qty": qty,
                 "quote_sum": quote_sum,
                 "fee_quote": fee_quote,
+                "fee_base": fee_base,
                 "ts": ts,
             }
             return
@@ -1433,6 +2099,7 @@ class GridBacktestAdapter:
         cur["qty"] = _d(cur.get("qty", 0)) + qty
         cur["quote_sum"] = _d(cur.get("quote_sum", 0)) + quote_sum
         cur["fee_quote"] = _d(cur.get("fee_quote", 0)) + fee_quote
+        cur["fee_base"] = _d(cur.get("fee_base", 0)) + fee_base
         if cur.get("ts") is None and ts is not None:
             cur["ts"] = ts
 
@@ -1508,11 +2175,17 @@ class GridBacktestAdapter:
             total += qty * price
         return total
 
-    def _resolve_spend_quote(self, broker: Any = None) -> Decimal:
+    def _resolve_spend_quote(self, broker: Any = None, desired_orders: Optional[int] = None) -> Decimal:
         if self.spend_pct_of_quote is None:
             return self.spend_quote
         if broker is None:
             return self.spend_quote
+        try:
+            desired_orders_i = int(desired_orders) if desired_orders is not None else 1
+        except Exception:
+            desired_orders_i = 1
+        if desired_orders_i <= 0:
+            desired_orders_i = 1
 
         total_capital_quote = self._total_capital_in_quote(broker)
         if total_capital_quote <= 0:
@@ -1544,8 +2217,12 @@ class GridBacktestAdapter:
         if max_spend_net_placeable <= 0:
             return Decimal("0")
 
-        if target_spend_net > max_spend_net_placeable:
+        per_order_cap = max_spend_net_placeable / Decimal(desired_orders_i)
+        if per_order_cap <= 0:
             return Decimal("0")
+
+        if target_spend_net > per_order_cap:
+            return per_order_cap
         return target_spend_net
 
 
@@ -1832,33 +2509,8 @@ class GridBacktestAdapter:
         except Exception:
             return
 
-        # --- restart safety: drop stale pending state when broker has no active orders ---
-        # After restart we may restore pending_* from a state file, but broker can start with
-        # open_orders empty (or only terminal statuses). In that case stale pending_* will
-        # consume BUY slots and we end up placing fewer BUY orders than grid_n_buy.
-        try:
-            active_cnt = 0
-            for o in orders_iter:
-                st_raw = _get(o, "status", "state", default=None)
-                if st_raw is not None:
-                    st = str(st_raw).upper()
-                    if st in {"FILLED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED", "CLOSED"}:
-                        continue
-                active_cnt += 1
-
-            if active_cnt == 0 and (self.pending_buy_levels or self.pending_sell_levels):
-                self.pending_buy_levels.clear()
-                self.pending_sell_levels.clear()
-                self._buy_level_by_order_ref.clear()
-                self._sell_level_by_order_ref.clear()
-                self._buy_reject_until_by_level.clear()
-                self._planned_qty_by_order_ref.clear()
-                self._pending_buy_seen_at.clear()
-        except Exception:
-            pass
-
         broker_buy: dict[str, Decimal] = {}
-        broker_sell: dict[str, Decimal] = {}
+        broker_sell_prices: dict[str, Decimal] = {}
 
         for o in orders_iter:
             side = self._norm_side(_get(o, "side", default=None))
@@ -1888,14 +2540,17 @@ class GridBacktestAdapter:
             if side == "BUY":
                 broker_buy[key] = px
             else:
-                broker_sell[key] = px
+                broker_sell_prices[key] = px
 
-        # SELL pending keys are composite in adapter state: "price|open_seq"
-        desired_sell_keys = {
-            f"{self._k(lot.sell_price)}|{lot.open_seq}"
-            for lot in self.open_lots
-            if getattr(lot, "qty", Decimal("0")) > 0
-        }
+        # SELL pending keys are normalized prices (one SELL target per price).
+        desired_sell_keys: set[str] = set()
+        for lot in self.open_lots:
+            if getattr(lot, "qty", Decimal("0")) <= 0:
+                continue
+            px = _round_tick(_d(getattr(lot, "sell_price", Decimal("0"))), self.tick_size)
+            if px <= 0:
+                continue
+            desired_sell_keys.add(self._k(px))
 
         # IMPORTANT:
         # Broker open_orders snapshot can lag right after placement.
@@ -1904,11 +2559,17 @@ class GridBacktestAdapter:
         # So we MERGE broker-visible orders into local pending instead of replacing.
 
         # BUY keys are simple normalized prices
-        desired_buy_keys = {self._k(px) for px in self.buy_orders}
+        desired_buy_keys: set[str] = set()
+        for px_raw in self.buy_orders:
+            px = _round_tick(_d(px_raw), self.tick_size)
+            if px <= 0:
+                continue
+            desired_buy_keys.add(self._k(px))
 
         now_ts = self.last_quote_ts or datetime.now(timezone.utc)
         now_ts = now_ts if now_ts.tzinfo is not None else now_ts.replace(tzinfo=timezone.utc)
-        grace = timedelta(seconds=int(getattr(self, "_pending_reconcile_grace_seconds", 5)))
+        buy_grace = timedelta(seconds=int(getattr(self, "_pending_buy_reconcile_grace_seconds", 120)))
+        sell_grace = timedelta(seconds=int(getattr(self, "_pending_sell_reconcile_grace_seconds", 15)))
 
         # брокерные BUY считаем “увиденными сейчас”
         for k in broker_buy.keys():
@@ -1924,7 +2585,7 @@ class GridBacktestAdapter:
                 merged_buy[k] = broker_buy[k]
                 continue
             seen_at = self._pending_buy_seen_at.get(k)
-            if seen_at is not None and (now_ts - seen_at) <= grace:
+            if seen_at is not None and (now_ts - seen_at) <= buy_grace:
                 merged_buy[k] = v
                 continue
             # stale -> дропаем
@@ -1935,23 +2596,27 @@ class GridBacktestAdapter:
             if k in desired_buy_keys:
                 merged_buy[k] = v
 
-        # SELL keys are composite ("price|open_seq"), broker_sell is keyed only by price.
-        local_sell_by_price: dict[str, list[str]] = {}
-        for comp_key in list(self.pending_sell_levels.keys()):
-            price_key = str(comp_key).split("|", 1)[0]
-            local_sell_by_price.setdefault(price_key, []).append(comp_key)
+        merged_sell: dict[str, Decimal] = {}
 
-        desired_sell_keys_by_price: dict[str, list[str]] = {}
-        for comp_key in desired_sell_keys:
-            price_key = str(comp_key).split("|", 1)[0]
-            desired_sell_keys_by_price.setdefault(price_key, []).append(comp_key)
+        for k in broker_sell_prices.keys():
+            self._pending_sell_seen_at[k] = now_ts
 
-        merged_sell = {k: v for k, v in self.pending_sell_levels.items() if k in desired_sell_keys}
-        for price_key, price_val in broker_sell.items():
-            target_keys = local_sell_by_price.get(price_key) or desired_sell_keys_by_price.get(price_key) or []
-            for comp_key in target_keys:
-                if comp_key in desired_sell_keys:
-                    merged_sell[comp_key] = price_val
+        for k, v in (self.pending_sell_levels or {}).items():
+            if k not in desired_sell_keys:
+                continue
+            if k in broker_sell_prices:
+                merged_sell[k] = broker_sell_prices[k]
+                continue
+            seen_at = self._pending_sell_seen_at.get(k)
+            if seen_at is not None and (now_ts - seen_at) <= sell_grace:
+                merged_sell[k] = v
+                continue
+            self._pending_sell_seen_at.pop(k, None)
+
+        for k, v in broker_sell_prices.items():
+            if k in desired_sell_keys:
+                merged_sell[k] = v
+
         self.pending_sell_levels = merged_sell
 
         self._buy_reject_until_by_level = {k: v for k, v in self._buy_reject_until_by_level.items() if k in desired_buy_keys}
@@ -1959,6 +2624,10 @@ class GridBacktestAdapter:
 
         self.pending_buy_levels = merged_buy
         self._pending_buy_seen_at = {k: t for k, t in self._pending_buy_seen_at.items() if k in desired_buy_keys}
+        self._pending_sell_seen_at = {k: t for k, t in self._pending_sell_seen_at.items() if k in desired_sell_keys}
+        self._sell_replace_cooldown_until_by_key = {
+            k: t for k, t in self._sell_replace_cooldown_until_by_key.items() if k in desired_sell_keys
+        }
 
     def _order_sig(self, side: str, qty: Decimal, price: Decimal) -> str:
         s = self._norm_side(side)
@@ -1972,15 +2641,15 @@ class GridBacktestAdapter:
         p_s = format(p.quantize(Decimal("0.00000001")), "f")
         return f"{s}|{q_s}|{p_s}"
 
-    def _broker_open_order_sigs(self, broker: Any) -> set[str]:
-        sigs: set[str] = set()
+    def _broker_open_order_sig_counts(self, broker: Any) -> dict[str, int]:
+        sig_counts: dict[str, int] = {}
         raw = getattr(broker, "open_orders", None)
         if raw is None:
-            return sigs
+            return sig_counts
         try:
             orders = list(raw)
         except Exception:
-            return sigs
+            return sig_counts
 
         for o in orders:
             try:
@@ -2008,11 +2677,527 @@ class GridBacktestAdapter:
                 if px <= 0 or qty <= 0:
                     continue
 
-                sigs.add(self._order_sig(side, qty, px))
+                sig = self._order_sig(side, qty, px)
+                sig_counts[sig] = int(sig_counts.get(sig, 0)) + 1
             except Exception:
                 continue
 
-        return sigs
+        return sig_counts
+
+    def _schedule_awaitable(self, maybe_awaitable: Any) -> None:
+        try:
+            import asyncio as _asyncio
+            if _asyncio.iscoroutine(maybe_awaitable):
+                try:
+                    loop = _asyncio.get_running_loop()
+                    loop.create_task(maybe_awaitable)
+                except RuntimeError:
+                    return
+        except Exception:
+            return
+
+    def _broker_active_strategy_orders(self, broker: Any) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        raw = getattr(broker, "open_orders", None)
+        if raw is None:
+            return out
+        try:
+            orders = list(raw)
+        except Exception:
+            return out
+
+        for o in orders:
+            try:
+                if not self._order_is_active(o):
+                    continue
+                if self._is_local_broker_order(o):
+                    continue
+                oid = _get(o, "order_id", "orderId", "id", default=None)
+                coid = _get(o, "client_order_id", "clientOrderId", "origClientOrderId", default=None)
+                oid_s = str(oid).strip() if oid is not None else ""
+                coid_s = str(coid).strip() if coid is not None else ""
+                # If we already finalized a fill for this exchange order id, treat broker snapshot row
+                # as stale and exclude it from active-order math (slot rebalance, dedupe, etc.).
+                if oid_s and oid_s in self._finalized_fill_order_refs:
+                    continue
+                side = self._norm_side(_get(o, "side", default=None))
+                if side not in {"BUY", "SELL"}:
+                    continue
+                px = _d(_get(o, "limit_price", "price", "limit", "px", default=0))
+                qty = _d(_get(o, "qty", "quantity", "origQty", "orig_qty", default=0))
+                out.append(
+                    {
+                        "order": o,
+                        "side": side,
+                        "price": px,
+                        "qty": qty,
+                        "order_id": oid_s,
+                        "client_order_id": coid_s,
+                    }
+                )
+            except Exception:
+                continue
+        return out
+
+    def _cancel_order_refs_best_effort(self, broker: Any, *, order_id: str = "", client_order_id: str = "") -> bool:
+        oid_s = str(order_id or "").strip()
+        coid_s = str(client_order_id or "").strip()
+        if not oid_s and not coid_s:
+            return False
+
+        cancel_fns: list[Any] = []
+        for name in ("cancel_order", "cancel", "cancel_limit", "cancel_open_order"):
+            fn = getattr(broker, name, None)
+            if callable(fn):
+                cancel_fns.append(fn)
+        if not cancel_fns:
+            return False
+
+        for fn in cancel_fns:
+            if oid_s:
+                try:
+                    out = fn(order_id=oid_s, symbol=self.symbol)
+                    self._schedule_awaitable(out)
+                    return True
+                except TypeError:
+                    pass
+                except Exception:
+                    pass
+                try:
+                    out = fn(order_id=oid_s)
+                    self._schedule_awaitable(out)
+                    return True
+                except TypeError:
+                    pass
+                except Exception:
+                    pass
+                try:
+                    out = fn(oid_s)
+                    self._schedule_awaitable(out)
+                    return True
+                except Exception:
+                    pass
+
+            if coid_s:
+                try:
+                    out = fn(client_order_id=coid_s, symbol=self.symbol)
+                    self._schedule_awaitable(out)
+                    return True
+                except TypeError:
+                    pass
+                except Exception:
+                    pass
+                try:
+                    out = fn(origClientOrderId=coid_s, symbol=self.symbol)
+                    self._schedule_awaitable(out)
+                    return True
+                except TypeError:
+                    pass
+                except Exception:
+                    pass
+        return False
+
+    def _dedupe_duplicate_buy_prices(self, broker: Any) -> None:
+        """Cancel extra BUY orders that share the same price level."""
+        if broker is None:
+            return
+
+        now_ts = self.last_quote_ts or datetime.now(timezone.utc)
+        if now_ts.tzinfo is None:
+            now_ts = now_ts.replace(tzinfo=timezone.utc)
+        else:
+            now_ts = now_ts.astimezone(timezone.utc)
+
+        last_ts = self._last_buy_price_dedupe_ts
+        if last_ts is not None:
+            last_utc = last_ts if last_ts.tzinfo is not None else last_ts.replace(tzinfo=timezone.utc)
+            if (now_ts - last_utc).total_seconds() < int(getattr(self, "_buy_price_dedupe_cooldown_seconds", 2)):
+                return
+
+        active = self._broker_active_strategy_orders(broker)
+        if not active:
+            return
+
+        by_price: dict[str, list[dict[str, Any]]] = {}
+        for meta in active:
+            if meta.get("side") != "BUY":
+                continue
+            px = _d(meta.get("price", Decimal("0")))
+            if px <= 0:
+                continue
+            by_price.setdefault(self._k(px), []).append(meta)
+
+        to_cancel: list[dict[str, Any]] = []
+        dup_levels = 0
+        for _, items in by_price.items():
+            if len(items) <= 1:
+                continue
+            dup_levels += 1
+            # Keep one order with max qty, cancel the rest.
+            sorted_items = sorted(
+                items,
+                key=lambda m: (
+                    _d(m.get("qty", Decimal("0"))),
+                    str(m.get("order_id") or m.get("client_order_id") or ""),
+                ),
+                reverse=True,
+            )
+            to_cancel.extend(sorted_items[1:])
+
+        if not to_cancel:
+            return
+
+        cancelled_oids: set[str] = set()
+        cancelled_coids: set[str] = set()
+        cancelled_cnt = 0
+        for meta in to_cancel:
+            oid_s = str(meta.get("order_id") or "").strip()
+            coid_s = str(meta.get("client_order_id") or "").strip()
+            if not self._cancel_order_refs_best_effort(broker, order_id=oid_s, client_order_id=coid_s):
+                continue
+
+            cancelled_cnt += 1
+            if oid_s:
+                cancelled_oids.add(oid_s)
+            if coid_s:
+                cancelled_coids.add(coid_s)
+
+            px = _d(meta.get("price", Decimal("0")))
+            if px > 0:
+                key = self._k(px)
+                self.pending_buy_levels.pop(key, None)
+                self._pending_buy_seen_at.pop(key, None)
+                self._buy_reject_until_by_level.pop(key, None)
+
+            for ref in (oid_s, coid_s):
+                if not ref:
+                    continue
+                self._buy_level_by_order_ref.pop(ref, None)
+                self._planned_qty_by_order_ref.pop(ref, None)
+                self._fill_accum_by_order_ref.pop(ref, None)
+
+        if cancelled_cnt <= 0:
+            return
+
+        self._last_buy_price_dedupe_ts = now_ts
+        logger.warning(
+            "GRID_SYNC buy_price_dedupe | symbol={} cancelled={} duplicate_levels={}",
+            self.symbol,
+            cancelled_cnt,
+            dup_levels,
+        )
+
+        # Optimistically update local broker cache so same tick can re-place missing levels.
+        try:
+            raw_orders = getattr(broker, "open_orders", None)
+            if raw_orders is not None:
+                kept: list[Any] = []
+                for o in list(raw_orders):
+                    try:
+                        if self._is_local_broker_order(o):
+                            kept.append(o)
+                            continue
+                        oid = _get(o, "order_id", "orderId", "id", default=None)
+                        coid = _get(o, "client_order_id", "clientOrderId", "origClientOrderId", default=None)
+                        oid_s = str(oid).strip() if oid is not None else ""
+                        coid_s = str(coid).strip() if coid is not None else ""
+                        if oid_s and oid_s in cancelled_oids:
+                            continue
+                        if coid_s and coid_s in cancelled_coids:
+                            continue
+                        kept.append(o)
+                    except Exception:
+                        kept.append(o)
+                broker.open_orders = kept
+        except Exception:
+            pass
+
+        try:
+            ro = getattr(broker, "refresh_open_orders", None)
+            if callable(ro):
+                self._schedule_awaitable(ro())
+        except Exception:
+            pass
+
+    def _enforce_buy_ladder_cap(self, broker: Any, *, desired_buy_keys: set[str], max_buy: int) -> None:
+        """Cancel BUY orders outside ladder and trim excess BUY count."""
+        if broker is None or max_buy < 0:
+            return
+
+        now_ts = self.last_quote_ts or datetime.now(timezone.utc)
+        if now_ts.tzinfo is None:
+            now_ts = now_ts.replace(tzinfo=timezone.utc)
+        else:
+            now_ts = now_ts.astimezone(timezone.utc)
+
+        last_ts = self._last_buy_ladder_prune_ts
+        if last_ts is not None:
+            last_utc = last_ts if last_ts.tzinfo is not None else last_ts.replace(tzinfo=timezone.utc)
+            if (now_ts - last_utc).total_seconds() < int(getattr(self, "_buy_ladder_prune_cooldown_seconds", 2)):
+                return
+
+        active = self._broker_active_strategy_orders(broker)
+        if not active:
+            return
+
+        buys: list[dict[str, Any]] = []
+        for meta in active:
+            if meta.get("side") != "BUY":
+                continue
+            px = _d(meta.get("price", Decimal("0")))
+            if px <= 0:
+                continue
+            meta = dict(meta)
+            meta["price_key"] = self._k(px)
+            buys.append(meta)
+        if not buys:
+            return
+
+        to_cancel: list[dict[str, Any]] = []
+        for meta in buys:
+            if desired_buy_keys and str(meta.get("price_key")) not in desired_buy_keys:
+                to_cancel.append(meta)
+
+        # If still above cap after removing non-ladder buys, keep highest BUY levels.
+        if max_buy >= 0:
+            survivors = [m for m in buys if m not in to_cancel]
+            if len(survivors) > max_buy:
+                survivors_sorted = sorted(survivors, key=lambda m: _d(m.get("price", Decimal("0"))), reverse=True)
+                keep_ids: set[str] = set()
+                for row in survivors_sorted[:max_buy]:
+                    oid_s = str(row.get("order_id") or "").strip()
+                    coid_s = str(row.get("client_order_id") or "").strip()
+                    if oid_s:
+                        keep_ids.add(f"oid:{oid_s}")
+                    if coid_s:
+                        keep_ids.add(f"coid:{coid_s}")
+                for row in survivors_sorted[max_buy:]:
+                    oid_s = str(row.get("order_id") or "").strip()
+                    coid_s = str(row.get("client_order_id") or "").strip()
+                    marker_oid = f"oid:{oid_s}" if oid_s else ""
+                    marker_coid = f"coid:{coid_s}" if coid_s else ""
+                    if marker_oid and marker_oid in keep_ids:
+                        continue
+                    if marker_coid and marker_coid in keep_ids:
+                        continue
+                    to_cancel.append(row)
+
+        if not to_cancel:
+            return
+
+        seen_cancel_refs: set[str] = set()
+        cancelled_oids: set[str] = set()
+        cancelled_coids: set[str] = set()
+        cancelled_cnt = 0
+        for meta in to_cancel:
+            oid_s = str(meta.get("order_id") or "").strip()
+            coid_s = str(meta.get("client_order_id") or "").strip()
+            uniq = f"{oid_s}|{coid_s}"
+            if uniq in seen_cancel_refs:
+                continue
+            seen_cancel_refs.add(uniq)
+
+            if not self._cancel_order_refs_best_effort(broker, order_id=oid_s, client_order_id=coid_s):
+                continue
+
+            cancelled_cnt += 1
+            if oid_s:
+                cancelled_oids.add(oid_s)
+            if coid_s:
+                cancelled_coids.add(coid_s)
+
+            px = _d(meta.get("price", Decimal("0")))
+            if px > 0:
+                key = self._k(px)
+                self.pending_buy_levels.pop(key, None)
+                self._pending_buy_seen_at.pop(key, None)
+                self._buy_reject_until_by_level.pop(key, None)
+
+            for ref in (oid_s, coid_s):
+                if not ref:
+                    continue
+                self._buy_level_by_order_ref.pop(ref, None)
+                self._planned_qty_by_order_ref.pop(ref, None)
+                self._fill_accum_by_order_ref.pop(ref, None)
+
+        if cancelled_cnt <= 0:
+            return
+
+        self._last_buy_ladder_prune_ts = now_ts
+        logger.warning(
+            "GRID_SYNC buy_ladder_prune | symbol={} cancelled={} max_buy={} desired_levels={}",
+            self.symbol,
+            cancelled_cnt,
+            max_buy,
+            len(desired_buy_keys),
+        )
+
+        try:
+            raw_orders = getattr(broker, "open_orders", None)
+            if raw_orders is not None:
+                kept: list[Any] = []
+                for o in list(raw_orders):
+                    try:
+                        if self._is_local_broker_order(o):
+                            kept.append(o)
+                            continue
+                        oid = _get(o, "order_id", "orderId", "id", default=None)
+                        coid = _get(o, "client_order_id", "clientOrderId", "origClientOrderId", default=None)
+                        oid_s = str(oid).strip() if oid is not None else ""
+                        coid_s = str(coid).strip() if coid is not None else ""
+                        if oid_s and oid_s in cancelled_oids:
+                            continue
+                        if coid_s and coid_s in cancelled_coids:
+                            continue
+                        kept.append(o)
+                    except Exception:
+                        kept.append(o)
+                broker.open_orders = kept
+        except Exception:
+            pass
+
+        try:
+            ro = getattr(broker, "refresh_open_orders", None)
+            if callable(ro):
+                self._schedule_awaitable(ro())
+        except Exception:
+            pass
+
+    def _trim_buy_orders_for_sell_priority(self, broker: Any, *, desired_sell_cnt: int, max_total: int) -> None:
+        if broker is None or max_total <= 0:
+            return
+
+        now_ts = self.last_quote_ts or datetime.now(timezone.utc)
+        if now_ts.tzinfo is None:
+            now_ts = now_ts.replace(tzinfo=timezone.utc)
+        else:
+            now_ts = now_ts.astimezone(timezone.utc)
+
+        # Right after fill handling we can still see stale open_orders rows from broker snapshot.
+        # In this window, slot rebalance may cancel a BUY even though natural fill removal
+        # would already free the required slot for SELL.
+        last_fill_ts = self._last_fill_ts
+        if last_fill_ts is not None:
+            last_fill_utc = last_fill_ts if last_fill_ts.tzinfo is not None else last_fill_ts.replace(tzinfo=timezone.utc)
+            after_fill_cooldown = int(getattr(self, "_order_slot_rebalance_after_fill_cooldown_seconds", 8))
+            if after_fill_cooldown > 0 and (now_ts - last_fill_utc).total_seconds() < after_fill_cooldown:
+                return
+
+        last_ts = self._last_order_slot_rebalance_ts
+        if last_ts is not None:
+            last_utc = last_ts if last_ts.tzinfo is not None else last_ts.replace(tzinfo=timezone.utc)
+            if (now_ts - last_utc).total_seconds() < int(getattr(self, "_order_slot_rebalance_cooldown_seconds", 2)):
+                return
+
+        active = self._broker_active_strategy_orders(broker)
+        if not active:
+            return
+
+        active_buys = [m for m in active if m.get("side") == "BUY"]
+        active_sells = [m for m in active if m.get("side") == "SELL"]
+        active_total = len(active)
+
+        sell_coverage = len(active_sells)
+        if len(self.pending_sell_levels) > sell_coverage:
+            sell_coverage = len(self.pending_sell_levels)
+        missing_sells = desired_sell_cnt - sell_coverage
+        if missing_sells < 0:
+            missing_sells = 0
+
+        # Need to free slots so missing SELL exits can be placed while respecting max_total.
+        cancel_needed = active_total + missing_sells - max_total
+        if cancel_needed <= 0:
+            return
+
+        if not active_buys:
+            logger.debug(
+                "GRID_SYNC slot_rebalance skipped | symbol={} reason=no_active_buys active_total={} max_total={} missing_sells={}",
+                self.symbol,
+                active_total,
+                max_total,
+                missing_sells,
+            )
+            return
+
+        cancel_needed = min(cancel_needed, len(active_buys))
+        buys_sorted = sorted(active_buys, key=lambda m: _d(m.get("price", Decimal("0"))))
+        to_cancel = buys_sorted[:cancel_needed]
+
+        cancelled_oids: set[str] = set()
+        cancelled_coids: set[str] = set()
+        cancelled_cnt = 0
+        for meta in to_cancel:
+            oid_s = str(meta.get("order_id") or "").strip()
+            coid_s = str(meta.get("client_order_id") or "").strip()
+            if not self._cancel_order_refs_best_effort(broker, order_id=oid_s, client_order_id=coid_s):
+                continue
+
+            cancelled_cnt += 1
+            if oid_s:
+                cancelled_oids.add(oid_s)
+            if coid_s:
+                cancelled_coids.add(coid_s)
+
+            px = _d(meta.get("price", Decimal("0")))
+            if px > 0:
+                key = self._k(px)
+                self.pending_buy_levels.pop(key, None)
+                self._pending_buy_seen_at.pop(key, None)
+                self._buy_reject_until_by_level.pop(key, None)
+
+            for ref in (oid_s, coid_s):
+                if not ref:
+                    continue
+                self._buy_level_by_order_ref.pop(ref, None)
+                self._planned_qty_by_order_ref.pop(ref, None)
+                self._fill_accum_by_order_ref.pop(ref, None)
+
+        if cancelled_cnt <= 0:
+            return
+
+        self._last_order_slot_rebalance_ts = now_ts
+        logger.warning(
+            "GRID_SYNC slot_rebalance | symbol={} cancelled_buys={} active_total={} max_total={} desired_sell_cnt={} active_sells={} pending_sells={}",
+            self.symbol,
+            cancelled_cnt,
+            active_total,
+            max_total,
+            desired_sell_cnt,
+            len(active_sells),
+            len(self.pending_sell_levels),
+        )
+
+        # Optimistically free slots in local broker cache for same-tick resync.
+        try:
+            raw_orders = getattr(broker, "open_orders", None)
+            if raw_orders is not None:
+                kept: list[Any] = []
+                for o in list(raw_orders):
+                    try:
+                        if self._is_local_broker_order(o):
+                            kept.append(o)
+                            continue
+                        oid = _get(o, "order_id", "orderId", "id", default=None)
+                        coid = _get(o, "client_order_id", "clientOrderId", "origClientOrderId", default=None)
+                        oid_s = str(oid).strip() if oid is not None else ""
+                        coid_s = str(coid).strip() if coid is not None else ""
+                        if oid_s and oid_s in cancelled_oids:
+                            continue
+                        if coid_s and coid_s in cancelled_coids:
+                            continue
+                        kept.append(o)
+                    except Exception:
+                        kept.append(o)
+                broker.open_orders = kept
+        except Exception:
+            pass
+
+        try:
+            ro = getattr(broker, "refresh_open_orders", None)
+            if callable(ro):
+                self._schedule_awaitable(ro())
+        except Exception:
+            pass
 
 
     def _update_drawdown(self, broker: Any) -> None:
@@ -2033,6 +3218,13 @@ class GridBacktestAdapter:
         if dd_pct > self._max_dd_pct:
             self._max_dd_pct = dd_pct
 
+    def _is_duplicate_order_error(self, err: Any) -> bool:
+        try:
+            s = str(err).strip().lower()
+        except Exception:
+            return False
+        return "duplicate order sent" in s
+
     def _place_limit_safe(self, broker: Any, *, side: str, qty: Decimal, limit_price: Decimal) -> bool:
         """Try common broker signatures without hard dependency on enum classes."""
         if qty <= 0 or limit_price <= 0:
@@ -2052,6 +3244,15 @@ class GridBacktestAdapter:
             pass
         except Exception as e:
             self._last_place_limit_error = str(e)
+            if self._is_duplicate_order_error(e):
+                logger.debug(
+                    "GRID_PLACE duplicate treated as already_open | side={} qty={} px={} err={}",
+                    side,
+                    qty,
+                    limit_price,
+                    e,
+                )
+                return True
             logger.warning(
                 "GRID_PLACE broker.place_limit failed | sig=side,qty,limit_price side={} qty={} px={} err={}",
                 side,
@@ -2071,7 +3272,16 @@ class GridBacktestAdapter:
                 self._notify_execution_order_placed(order_obj, side=side, qty=qty, limit_price=limit_price)
                 return True
             except Exception as e:
-                self._last_place_limit_error = str(e)                
+                self._last_place_limit_error = str(e)
+                if self._is_duplicate_order_error(e):
+                    logger.debug(
+                        "GRID_PLACE duplicate treated as already_open | side={} qty={} px={} kwargs={}",
+                        side,
+                        qty,
+                        limit_price,
+                        tuple(sorted(kwargs.keys())),
+                    )
+                    return True
                 logger.warning(
                     "GRID_PLACE broker.place_limit failed | kwargs={} side={} qty={} px={} err= {}",
                     tuple(sorted(kwargs.keys())),
@@ -2089,6 +3299,14 @@ class GridBacktestAdapter:
             return True
         except Exception as e:
             self._last_place_limit_error = str(e)
+            if self._is_duplicate_order_error(e):
+                logger.debug(
+                    "GRID_PLACE duplicate treated as already_open | side={} qty={} px={} path=positional",
+                    side,
+                    qty,
+                    limit_price,
+                )
+                return True
             self.place_limit_failures += 1
             logger.warning(
                 "GRID_PLACE broker.place_limit failed | positional side={} qty={} px={} err={}",
@@ -2233,40 +3451,16 @@ class GridBacktestAdapter:
             "duplicate_pending_skips": self.duplicate_pending_skips,
             "buy_reject_cooldown_seconds": self._buy_reject_cooldown_seconds,
             "buy_reject_until_by_level": {k: (v.isoformat() if v is not None else None) for k, v in self._buy_reject_until_by_level.items()},            
+            "pending_sell_seen_at": {k: (v.isoformat() if v is not None else None) for k, v in self._pending_sell_seen_at.items()},
             "place_limit_failures": self.place_limit_failures,
             "unknown_fill_side": self.unknown_fill_side,
             "init_done": self.init_done,
             "peak_equity": str(self._peak_equity) if self._peak_equity is not None else None,
             "max_dd_abs": str(self._max_dd_abs),
             "max_dd_pct": str(self._max_dd_pct),
-            "retained_profit_base": str(self.retained_profit_base),
             "manual_deposits_total": str(self.manual_deposits_total),
-            "manual_withdrawals_total": str(self.manual_withdrawals_total),
             "core_initial_quote": str(_d(getattr(self._core.state, "initial_quote", Decimal("0")))),
             "core_deposits_total": str(_d(getattr(self._core.state, "deposits_total", Decimal("0")))),
-            "core_withdrawals_total": str(_d(getattr(self._core.state, "withdrawals_total", Decimal("0")))),
-            "pending_year_end_withdrawal": self.pending_year_end_withdrawal,
-            "pending_year_end_withdrawal_deadline_ts": (
-                self.pending_year_end_withdrawal_deadline_ts.isoformat()
-                if self.pending_year_end_withdrawal_deadline_ts is not None
-                else None
-            ),
-            "pending_year_end_profit_quote": str(self.pending_year_end_profit_quote),
-            "pending_year_end_withdraw_quote": str(self.pending_year_end_withdraw_quote),
-            "pending_year_end_retain_quote": str(self.pending_year_end_retain_quote),
-            "pending_year_end_trigger_ts": (
-                self.pending_year_end_trigger_ts.isoformat()
-                if self.pending_year_end_trigger_ts is not None
-                else None
-            ),
-            "last_year_end_gate_key": self._last_year_end_gate_key,
-            "year_end_liquidation_active": self.year_end_liquidation_active,
-            "year_end_liquidation_started_ts": (
-                self.year_end_liquidation_started_ts.isoformat()
-                if self.year_end_liquidation_started_ts is not None
-                else None
-            ),
-            "year_end_liquidation_target_base_qty": str(self.year_end_liquidation_target_base_qty),
             "last_quote_ts": self.last_quote_ts.isoformat() if self.last_quote_ts is not None else None,
             "last_bar_close": str(self.last_bar_close) if self.last_bar_close is not None else None,
             "last_bar_ts": self.last_bar_ts.isoformat() if self.last_bar_ts is not None else None,
@@ -2333,6 +3527,11 @@ class GridBacktestAdapter:
         self.pending_sell_levels = {
             str(k): _d(v) for k, v in (state.get("pending_sell_levels") or {}).items()
         }
+        self._pending_sell_seen_at = {}
+        for k, v in (state.get("pending_sell_seen_at") or {}).items():
+            ts = self._parse_ts(v)
+            if ts is not None:
+                self._pending_sell_seen_at[str(k)] = ts
         self._buy_level_by_order_ref = {
             str(k): _d(v) for k, v in (state.get("buy_level_by_order_ref") or {}).items()
         }
@@ -2362,9 +3561,7 @@ class GridBacktestAdapter:
         self._peak_equity = _d(state["peak_equity"]) if state.get("peak_equity") is not None else self._peak_equity
         self._max_dd_abs = _d(state.get("max_dd_abs", self._max_dd_abs))
         self._max_dd_pct = _d(state.get("max_dd_pct", self._max_dd_pct))
-        self.retained_profit_base = _d(state.get("retained_profit_base", self.retained_profit_base))
         self.manual_deposits_total = _d(state.get("manual_deposits_total", self.manual_deposits_total))
-        self.manual_withdrawals_total = _d(state.get("manual_withdrawals_total", self.manual_withdrawals_total))
 
         # Restore cashflow fields into GridState if the current GridState version supports them.
         try:
@@ -2372,28 +3569,25 @@ class GridBacktestAdapter:
                 self._core.state.initial_quote = _d(state.get("core_initial_quote"))
             if hasattr(self._core.state, "deposits_total") and state.get("core_deposits_total") is not None:
                 self._core.state.deposits_total = _d(state.get("core_deposits_total"))
-            if hasattr(self._core.state, "withdrawals_total") and state.get("core_withdrawals_total") is not None:
-                self._core.state.withdrawals_total = _d(state.get("core_withdrawals_total"))
         except Exception:
             pass
-        self.pending_year_end_withdrawal = bool(state.get("pending_year_end_withdrawal", self.pending_year_end_withdrawal))
-        self.pending_year_end_withdrawal_deadline_ts = self._parse_ts(state.get("pending_year_end_withdrawal_deadline_ts"))
-        self.pending_year_end_profit_quote = _d(state.get("pending_year_end_profit_quote", self.pending_year_end_profit_quote))
-        self.pending_year_end_withdraw_quote = _d(state.get("pending_year_end_withdraw_quote", self.pending_year_end_withdraw_quote))
-        self.pending_year_end_retain_quote = _d(state.get("pending_year_end_retain_quote", self.pending_year_end_retain_quote))
-        self.pending_year_end_trigger_ts = self._parse_ts(state.get("pending_year_end_trigger_ts"))
-        self._last_year_end_gate_key = state.get("last_year_end_gate_key", self._last_year_end_gate_key)
-        self.year_end_liquidation_active = bool(state.get("year_end_liquidation_active", self.year_end_liquidation_active))
-        self.year_end_liquidation_started_ts = self._parse_ts(state.get("year_end_liquidation_started_ts"))
-        self.year_end_liquidation_target_base_qty = _d(
-            state.get("year_end_liquidation_target_base_qty", self.year_end_liquidation_target_base_qty)
-        )
-        self._buy_level_by_order_ref = {k: v for k, v in self._buy_level_by_order_ref.items() if k}
-        self._sell_level_by_order_ref = {k: v for k, v in self._sell_level_by_order_ref.items() if k}
+        # LOCAL-* client ids are session-scoped and can be reused after restart.
+        # Keeping them from a persisted snapshot can poison level mapping for new orders.
+        self._buy_level_by_order_ref = {
+            k: v for k, v in self._buy_level_by_order_ref.items()
+            if k and not str(k).upper().startswith("LOCAL-")
+        }
+        self._sell_level_by_order_ref = {
+            k: v for k, v in self._sell_level_by_order_ref.items()
+            if k and not str(k).upper().startswith("LOCAL-")
+        }
+        self._pending_sell_seen_at = {k: t for k, t in self._pending_sell_seen_at.items() if k in self.pending_sell_levels}
 
         # Restore planned order qty map (used to finalize partial fills safely)
         self._planned_qty_by_order_ref = {
-            str(k): _d(v) for k, v in (state.get("planned_qty_by_order_ref") or {}).items()
+            str(k): _d(v)
+            for k, v in (state.get("planned_qty_by_order_ref") or {}).items()
+            if str(k) and not str(k).upper().startswith("LOCAL-")
         }
 
         self._mirror_local_state_from_core()
@@ -2421,102 +3615,10 @@ class GridBacktestAdapter:
             "status": "deposit_registered",
             "amount": amt,
             "manual_deposits_total": self.manual_deposits_total,
-            "contributed_total": self._contributed_total_for_profit_gate(),
         }
 
     def on_deposit(self, amount: Any) -> dict[str, Any]:
         return self.register_deposit(amount)
-
-    def register_manual_withdrawal(self, amount: Any) -> dict[str, Any]:
-        """Register manual quote withdrawal for reporting (not used in year-end profit gate formula)."""
-        amt = _d(amount)
-        if amt <= 0:
-            return {"ok": False, "status": "invalid_amount", "amount": amt}
-
-        self.manual_withdrawals_total += amt
-
-        st = self._core.state
-        try:
-            if hasattr(st, "withdrawals_total"):
-                st.withdrawals_total = _d(getattr(st, "withdrawals_total", Decimal("0"))) + amt
-        except Exception:
-            pass
-
-        return {
-            "ok": True,
-            "status": "manual_withdrawal_registered",
-            "amount": amt,
-            "manual_withdrawals_total": self.manual_withdrawals_total,
-        }
-
-    def on_manual_withdrawal(self, amount: Any) -> dict[str, Any]:
-        return self.register_manual_withdrawal(amount)
-    def _contributed_total_for_profit_gate(self) -> Decimal:
-        """Best-effort contributed capital: initial deposit + monthly deposits.
-
-        We intentionally do NOT use withdrawals here, because the year-end trigger is a point-in-time
-        balance test against the required capital base, not a lifetime PnL metric.
-        """
-        st = self._core.state
-
-        contributed_fn = getattr(st, "contributed_total", None)
-        if callable(contributed_fn):
-            try:
-                return _d(contributed_fn())
-            except Exception:
-                pass
-
-        initial_quote = _d(getattr(st, "initial_quote", Decimal("0")))
-        deposits_total = _d(getattr(st, "deposits_total", Decimal("0")))
-        return initial_quote + deposits_total
-
-    def _exit_fee_rate_for_profit_gate(self) -> Decimal:
-        """Fee assumption for theoretical liquidation in year-end gate.
-
-        Prefer taker fee when provided, otherwise maker fee.
-        """
-        if self.taker_fee_rate > 0:
-            return self.taker_fee_rate
-        return self.maker_fee_rate
-
-    def _year_end_profit_gate(self, broker: Any, mark_price: Optional[Decimal] = None) -> dict[str, Decimal]:
-        """Point-in-time year-end profit gate used to decide whether closing all positions is allowed.
-
-        Formula (business rule):
-            free quote cash
-          + base market value net of theoretical exit fee
-          - (contributed capital + retained 10% from prior withdrawals)
-
-        `withdrawals_total` is intentionally excluded here.
-        """
-        px = mark_price if mark_price is not None else (self.last_mid or Decimal("0"))
-        quote_cash = self._broker_quote_cash(broker)
-        base_qty = self._broker_base_qty(broker)
-
-        exit_fee_rate = self._exit_fee_rate_for_profit_gate()
-        base_liq_value_gross = base_qty * px
-        base_liq_fee_est = base_liq_value_gross * exit_fee_rate
-        base_liq_value_net = base_liq_value_gross - base_liq_fee_est
-        if base_liq_value_net < 0:
-            base_liq_value_net = Decimal("0")
-
-        equity_liq_net = quote_cash + base_liq_value_net
-        contributed_total = self._contributed_total_for_profit_gate()
-        required_base = contributed_total + self.retained_profit_base
-        profit_gate = equity_liq_net - required_base
-
-        return {
-            "quote_cash": quote_cash,
-            "base_qty": base_qty,
-            "mark_price": px,
-            "exit_fee_rate": exit_fee_rate,
-            "base_liq_fee_est": base_liq_fee_est,
-            "base_liq_value_net": base_liq_value_net,
-            "equity_liq_net": equity_liq_net,
-            "contributed_total": contributed_total,
-            "required_base": required_base,
-            "profit_gate": profit_gate,
-        }
 
 
     def _broker_quote_total(self, broker: Any) -> Decimal:
@@ -2783,249 +3885,7 @@ class GridBacktestAdapter:
             return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
         except Exception:
             return None
-    def _is_year_boundary_bar_close(self, ts: Optional[datetime]) -> bool:
-        """True when a closed 15m candle ends exactly at 00:00 on January 1 (UTC)."""
-        if ts is None:
-            return False
-        ts_utc = ts.astimezone(timezone.utc) if ts.tzinfo is not None else ts.replace(tzinfo=timezone.utc)
-        return (
-            ts_utc.month == 1
-            and ts_utc.day == 1
-            and ts_utc.hour == 0
-            and ts_utc.minute == 0
-        )
 
-    def _clear_pending_year_end_withdrawal(self) -> None:
-        self.pending_year_end_withdrawal = False
-        self.pending_year_end_withdrawal_deadline_ts = None
-        self.pending_year_end_profit_quote = Decimal("0")
-        self.pending_year_end_withdraw_quote = Decimal("0")
-        self.pending_year_end_retain_quote = Decimal("0")
-        self.pending_year_end_trigger_ts = None
-        self.year_end_liquidation_active = False
-        self.year_end_liquidation_started_ts = None
-        self.year_end_liquidation_target_base_qty = Decimal("0")
-        # Clear local pending/order bindings to avoid stale matches after year-end flow
-        self.pending_buy_levels.clear()
-        self.pending_sell_levels.clear()
-        self._buy_level_by_order_ref.clear()
-        self._sell_level_by_order_ref.clear()
-        self._planned_qty_by_order_ref.clear()
-
-
-    def _start_year_end_liquidation(self, broker: Any, ts: Optional[datetime]) -> None:
-        """Start full portfolio liquidation (paper/live adapter intent) before withdrawal confirmation."""
-        self.year_end_liquidation_active = True
-        self.year_end_liquidation_started_ts = ts
-
-        # Freeze/clear tracked pending ladder orders so the grid is not re-armed.
-        self.pending_buy_levels.clear()
-        self.pending_sell_levels.clear()
-        self._buy_level_by_order_ref.clear()
-        self._sell_level_by_order_ref.clear()
-        self._planned_qty_by_order_ref.clear()
-        # Ensure no stale strategy ladder remains after liquidation starts.
-        self.buy_orders.clear()
-        self._core.state.buy_levels.clear()
-
-        base_qty = self._broker_base_qty(broker)
-        if base_qty <= 0:
-            self.year_end_liquidation_active = False
-            self.year_end_liquidation_target_base_qty = Decimal("0")
-            return
-
-        self.year_end_liquidation_target_base_qty = base_qty
-
-        # Aggressive limit below bid to maximize execution probability in paper/live.
-        limit_px = self.last_bid if self.last_bid is not None else (self.last_mid or Decimal("0"))
-        if limit_px > 0:
-            limit_px = limit_px * (Decimal("1") - Decimal("0.01"))
-
-        if limit_px <= 0:
-            return
-
-        self._place_limit_safe(broker, side="SELL", qty=base_qty, limit_price=limit_px)
-
-    def _maybe_open_year_end_withdrawal_window(self, broker: Any, ts: Optional[datetime]) -> None:
-        """Create a 14-day withdrawal confirmation window on year boundary if profit gate is positive.
-
-        This method does NOT close positions and does NOT execute real withdrawals.
-        It only prepares a pending request based on the business rule.
-        """
-        if not self._is_year_boundary_bar_close(ts):
-            return
-        if ts is None:
-            return
-
-        ts_utc = ts.astimezone(timezone.utc) if ts.tzinfo is not None else ts.replace(tzinfo=timezone.utc)
-        gate_key = ts_utc.isoformat()
-        if self._last_year_end_gate_key == gate_key:
-            return
-        self._last_year_end_gate_key = gate_key
-
-        gate = self._year_end_profit_gate(broker, mark_price=self.last_bar_close)
-        profit_gate = _d(gate.get("profit_gate", Decimal("0")))
-
-        # Reset any stale pending request before creating a new one for the new year boundary.
-        self._clear_pending_year_end_withdrawal()
-
-        if profit_gate <= 0:
-            return
-
-        withdraw_quote = profit_gate * Decimal("0.9")
-        retain_quote = profit_gate - withdraw_quote
-
-        self.pending_year_end_withdrawal = True
-        self.pending_year_end_trigger_ts = ts_utc
-        self.pending_year_end_withdrawal_deadline_ts = ts_utc + timedelta(days=14)
-        self.pending_year_end_profit_quote = profit_gate
-        self.pending_year_end_withdraw_quote = withdraw_quote
-        self.pending_year_end_retain_quote = retain_quote
-        self._start_year_end_liquidation(broker, ts_utc)
-
-
-    def _set_broker_quote_cash(self, broker: Any, new_quote_cash: Decimal) -> bool:
-        """Best-effort setter for paper broker quote cash."""
-        if new_quote_cash < 0:
-            new_quote_cash = Decimal("0")
-
-        for name in ("quote_balance", "cash_quote", "quote", "balance_quote"):
-            if hasattr(broker, name):
-                try:
-                    setattr(broker, name, new_quote_cash)
-                    return True
-                except Exception:
-                    pass
-
-        if hasattr(broker, "portfolio"):
-            pf = getattr(broker, "portfolio")
-            for name in ("quote", "cash_quote"):
-                if hasattr(pf, name):
-                    try:
-                        setattr(pf, name, new_quote_cash)
-                        return True
-                    except Exception:
-                        pass
-
-        return False
-
-    def expire_year_end_withdrawal_if_needed(self, now_ts: Any = None) -> bool:
-        """Auto-expire pending year-end withdrawal request after the 14-day window."""
-        if not self.pending_year_end_withdrawal:
-            return False
-        if self.pending_year_end_withdrawal_deadline_ts is None:
-            return False
-
-        now = self._parse_ts(now_ts)
-        if now is None:
-            now = datetime.now(timezone.utc)
-        if now.tzinfo is None:
-            now = now.replace(tzinfo=timezone.utc)
-        else:
-            now = now.astimezone(timezone.utc)
-
-        deadline = self.pending_year_end_withdrawal_deadline_ts
-        if deadline.tzinfo is None:
-            deadline = deadline.replace(tzinfo=timezone.utc)
-        else:
-            deadline = deadline.astimezone(timezone.utc)
-
-        if now <= deadline:
-            return False
-
-        self._clear_pending_year_end_withdrawal()
-        return True
-
-    def decline_year_end_withdrawal(self, now_ts: Any = None) -> dict[str, Any]:
-        """Decline/cancel the pending year-end withdrawal request."""
-        self.expire_year_end_withdrawal_if_needed(now_ts)
-
-        if not self.pending_year_end_withdrawal:
-            return {"ok": False, "status": "no_pending_request"}
-
-        trigger_ts = self.pending_year_end_trigger_ts
-        deadline_ts = self.pending_year_end_withdrawal_deadline_ts
-        self._clear_pending_year_end_withdrawal()
-        return {
-            "ok": True,
-            "status": "declined",
-            "trigger_ts": trigger_ts,
-            "deadline_ts": deadline_ts,
-        }
-
-    def approve_year_end_withdrawal(self, broker: Any, now_ts: Any = None) -> dict[str, Any]:
-        """Approve pending year-end withdrawal and deduct quote cash in paper mode.
-
-        Assumes positions are already closed. If base is still > 0, approval is rejected.
-        """
-        expired = self.expire_year_end_withdrawal_if_needed(now_ts)
-        if expired:
-            return {"ok": False, "status": "expired"}
-
-        if not self.pending_year_end_withdrawal:
-            return {"ok": False, "status": "no_pending_request"}
-
-        self._sync_core_balances_from_broker(broker)
-        base_qty = self._broker_base_qty(broker)
-        if base_qty > 0:
-            return {
-                "ok": False,
-                "status": "positions_not_closed",
-                "base_qty": base_qty,
-                "required_action": "close_all_positions_first",
-            }
-
-        quote_cash = self._broker_quote_cash(broker)
-        withdraw_quote = self.pending_year_end_withdraw_quote
-        retain_quote = self.pending_year_end_retain_quote
-        profit_quote = self.pending_year_end_profit_quote
-
-        if withdraw_quote <= 0:
-            self._clear_pending_year_end_withdrawal()
-            return {"ok": False, "status": "invalid_request_amount"}
-
-        if quote_cash < withdraw_quote:
-            return {
-                "ok": False,
-                "status": "insufficient_quote_cash",
-                "quote_cash": quote_cash,
-                "withdraw_quote": withdraw_quote,
-            }
-
-        new_quote_cash = quote_cash - withdraw_quote
-        if not self._set_broker_quote_cash(broker, new_quote_cash):
-            return {
-                "ok": False,
-                "status": "broker_quote_set_failed",
-                "quote_cash": quote_cash,
-                "withdraw_quote": withdraw_quote,
-            }
-
-        self.retained_profit_base += retain_quote
-        self.manual_withdrawals_total += withdraw_quote
-        try:
-            if hasattr(self._core.state, "withdrawals_total"):
-                self._core.state.withdrawals_total = _d(getattr(self._core.state, "withdrawals_total", Decimal("0"))) + withdraw_quote
-        except Exception:
-            pass
-        trigger_ts = self.pending_year_end_trigger_ts
-        deadline_ts = self.pending_year_end_withdrawal_deadline_ts
-
-        self._clear_pending_year_end_withdrawal()
-        self._sync_core_balances_from_broker(broker)
-        self._update_drawdown(broker)
-
-        return {
-            "ok": True,
-            "status": "approved_and_withdrawn",
-            "profit_quote": profit_quote,
-            "withdraw_quote": withdraw_quote,
-            "retain_quote": retain_quote,
-            "retained_profit_base": self.retained_profit_base,
-            "trigger_ts": trigger_ts,
-            "deadline_ts": deadline_ts,
-            "quote_cash_after": self._broker_quote_cash(broker),
-        }
     def _cancel_all_strategy_orders(self, broker: Any) -> None:
         """Best-effort cancel of all active strategy orders on the broker/exchange.
 
@@ -3050,6 +3910,8 @@ class GridBacktestAdapter:
             self.pending_buy_levels.clear()
             self.pending_sell_levels.clear()
             self._pending_buy_seen_at.clear()
+            self._pending_sell_seen_at.clear()
+            self._sell_replace_cooldown_until_by_key.clear()
             self._buy_level_by_order_ref.clear()
             self._sell_level_by_order_ref.clear()
             self._planned_qty_by_order_ref.clear()

@@ -367,6 +367,12 @@ def _fmt_log_val(x: Any) -> str:
         return str(x)
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    """Parse bool-like env flags: 1/true/yes/on."""
+    raw = str(os.getenv(name, "1" if default else "0")).strip().lower()
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
 # --- Telemetry Writer ---
 class JsonlTelemetryWriter:
     """Best-effort JSONL telemetry writer for quotes/trades/metrics."""
@@ -432,7 +438,6 @@ def _compact_adapter_preview(fields: dict[str, Any]) -> dict[str, Any]:
         "duplicate_place_skips",
         "duplicate_pending_skips",
         "place_limit_failures",
-        "pending_year_end_withdrawal",
     )
     out: dict[str, Any] = {}
     for k in keep_keys:
@@ -493,9 +498,6 @@ def _compact_adapter_suffix(fields: dict[str, Any], *, hb_dt: float | None = Non
 
     parts.append(f"dup_place={dup_place_total}(+{dup_place_delta}, {dup_place_rate:.1f}/s)")
     parts.append(f"dup_pending={dup_pending_total}(+{dup_pending_delta}, {dup_pending_rate:.1f}/s)")
-
-    if bool(fields.get("pending_year_end_withdrawal", False)):
-        parts.append("pending_year_end_withdrawal=True")
 
     return " | adapter=" + ", ".join(parts) if parts else ""
 
@@ -671,6 +673,9 @@ def _capture_runtime_state(*, symbol: str, strategy: Any, execution: Any, runtim
     try:
         if hasattr(strategy, "snapshot_state") and callable(getattr(strategy, "snapshot_state")):
             state["strategy"] = strategy.snapshot_state()
+        elif hasattr(strategy, "export_state") and callable(getattr(strategy, "export_state")):
+            # GridBacktestAdapter / GridPaperAdapter expose export_state()
+            state["strategy"] = strategy.export_state()
         elif hasattr(strategy, "get_state") and callable(getattr(strategy, "get_state")):
             state["strategy"] = strategy.get_state()
         elif hasattr(strategy, "state"):
@@ -702,6 +707,9 @@ def _apply_runtime_state(*, state: dict[str, Any], strategy: Any, runtime_stats:
     try:
         if hasattr(strategy, "restore_state") and callable(getattr(strategy, "restore_state")):
             strategy.restore_state(strategy_state)
+            return
+        if hasattr(strategy, "import_state") and callable(getattr(strategy, "import_state")):
+            strategy.import_state(strategy_state)
             return
         if hasattr(strategy, "load_state") and callable(getattr(strategy, "load_state")):
             strategy.load_state(strategy_state)
@@ -1022,15 +1030,24 @@ async def run_loop(*, symbol: str, strategy: Any, max_ticks: int = 0) -> None:
     canceled_total = 0
     partial_fills_total = 0
     new_orders_total = 0
+    # Log-noise controls for startup/local cancel storms.
+    log_local_cancel_events = _env_flag("RUN_DEMO_GRID_LOG_LOCAL_CANCELS", default=False)
+    log_startup_cancel_events = _env_flag("RUN_DEMO_GRID_LOG_STARTUP_CANCELS", default=False)
+    suppressed_local_cancel_logs = 0
+    suppressed_startup_cancel_logs = 0
     startup_sync_polls_left = max(0, int(os.getenv("RUN_DEMO_GRID_STARTUP_SYNC_POLLS", "2")))
     # --- REST polling throttle / backoff ---
     poll_fills_every_sec = float(os.getenv("RUN_DEMO_GRID_POLL_FILLS_EVERY_SEC", "5.0"))
     poll_updates_every_sec = float(os.getenv("RUN_DEMO_GRID_POLL_UPDATES_EVERY_SEC", "10.0"))
+    # Keep execution.open_orders fresh even without fills, so LOCAL-* placeholders expire
+    # and adapter sync does not work on stale snapshots.
+    refresh_open_orders_every_sec = float(os.getenv("RUN_DEMO_GRID_REFRESH_OPEN_ORDERS_EVERY_SEC", "2.0"))
 
     poll_backoff_max_sec = float(os.getenv("RUN_DEMO_GRID_POLL_BACKOFF_MAX_SEC", "120.0"))
     loop_mono = asyncio.get_running_loop().time
     next_poll_fills = loop_mono()
     next_poll_updates = loop_mono()
+    next_refresh_open_orders = loop_mono()
 
     poll_backoff_sec = 0.0
     stream = stream_book_ticker(symbol)
@@ -1043,6 +1060,7 @@ async def run_loop(*, symbol: str, strategy: Any, max_ticks: int = 0) -> None:
             now_mono = asyncio.get_running_loop().time()
             bid = Decimal(t.bid)
             ask = Decimal(t.ask)
+            tick_is_startup_sync = startup_sync_polls_left > 0
             runtime_stats["ws_messages"] = int(runtime_stats.get("ws_messages", 0)) + 1
             runtime_stats["ws_last_msg_ts"] = now_utc
             same_quote = (last_seen_bid == bid and last_seen_ask == ask)
@@ -1061,6 +1079,25 @@ async def run_loop(*, symbol: str, strategy: Any, max_ticks: int = 0) -> None:
                 spread=(ask - bid),
                 tick=tick_count,
             )
+
+            # Keep open-orders snapshot in sync on a timer (independent from fills/updates).
+            refresh_open_orders = getattr(execution, "refresh_open_orders", None)
+            if (
+                callable(refresh_open_orders)
+                and refresh_open_orders_every_sec > 0
+                and now_mono >= next_refresh_open_orders
+            ):
+                next_refresh_open_orders = now_mono + refresh_open_orders_every_sec + poll_backoff_sec
+                try:
+                    await _maybe_await(refresh_open_orders())
+                    if poll_backoff_sec > 0:
+                        poll_backoff_sec = max(0.0, poll_backoff_sec - 0.5)
+                except Exception as e:
+                    msg = str(e)
+                    if "-1003" in msg or "Too much request weight" in msg:
+                        poll_backoff_sec = min(max(poll_backoff_sec * 2.0, 5.0), poll_backoff_max_sec)
+                        next_refresh_open_orders = now_mono + refresh_open_orders_every_sec + poll_backoff_sec
+                    logger.warning("refresh_open_orders failed: {}", e)
 
             # min/max tracking
             min_bid = bid if (min_bid is None or bid < min_bid) else min_bid
@@ -1096,7 +1133,6 @@ async def run_loop(*, symbol: str, strategy: Any, max_ticks: int = 0) -> None:
                     if upd_key in seen_update_keys:
                         continue
                     seen_update_keys.add(upd_key)
-                    is_startup_sync = startup_sync_polls_left > 0
 
                     upd_order_id = _extract_order_id(upd)
                     upd_status_raw = _extract_fill_status(upd)
@@ -1111,7 +1147,7 @@ async def run_loop(*, symbol: str, strategy: Any, max_ticks: int = 0) -> None:
                         order_last_status[upd_order_id] = upd_status
 
                     if upd_status == "NEW":
-                        if not is_startup_sync:
+                        if not tick_is_startup_sync:
                             new_orders_total += 1
                         logger.info(
                             "ORDER_NEW {} {} qty={} price={} order_id={} ts={}",
@@ -1133,7 +1169,7 @@ async def run_loop(*, symbol: str, strategy: Any, max_ticks: int = 0) -> None:
                         )
 
                     elif upd_status == "PARTIALLY_FILLED":
-                        if not is_startup_sync:
+                        if not tick_is_startup_sync:
                             partial_fills_total += 1
                         logger.info(
                             "PARTIAL_FILL {} {} qty={} price={} order_id={} status={} ts={}",
@@ -1158,33 +1194,43 @@ async def run_loop(*, symbol: str, strategy: Any, max_ticks: int = 0) -> None:
                     elif upd_status == "CANCELED":
                         is_local_cancel = _is_local_order_id(upd_order_id)
 
-                        if not is_startup_sync and not is_local_cancel:
+                        if not tick_is_startup_sync and not is_local_cancel:
                             canceled_total += 1
-
-                        logger.info(
-                            "CANCEL order_id={} status={} source=order_updates local={} ts={}",
-                            (upd_order_id or "?"),
-                            upd_status,
-                            is_local_cancel,
-                            (upd_ts.isoformat() if isinstance(upd_ts, datetime) else upd_ts),
-                        )
 
                         # LOCAL-* — это локальные placeholder-ордера. Их нельзя отдавать в on_cancel(),
                         # иначе адаптер может повторно освободить капитал.
-                        if not is_startup_sync and not is_local_cancel:
+                        if not tick_is_startup_sync and not is_local_cancel:
                             _call_strategy_hook(strategy, "on_cancel", broker=execution, order_id=(upd_order_id or "?"))
 
-                        jsonl.trade(
-                            kind="cancel",
-                            ts=datetime.now(timezone.utc),
-                            symbol=symbol,
-                            tick=tick_count,
-                            order_update=upd,
-                            order_id=upd_order_id,
-                            source="order_updates",
-                            status=upd_status,
-                            local_placeholder=is_local_cancel,
-                        )
+                        emit_cancel_log = True
+                        if is_local_cancel and not log_local_cancel_events:
+                            emit_cancel_log = False
+                            suppressed_local_cancel_logs += 1
+                        if tick_is_startup_sync and not log_startup_cancel_events:
+                            emit_cancel_log = False
+                            suppressed_startup_cancel_logs += 1
+
+                        if emit_cancel_log:
+                            logger.info(
+                                "CANCEL order_id={} status={} source=order_updates local={} startup_sync={} ts={}",
+                                (upd_order_id or "?"),
+                                upd_status,
+                                is_local_cancel,
+                                tick_is_startup_sync,
+                                (upd_ts.isoformat() if isinstance(upd_ts, datetime) else upd_ts),
+                            )
+                            jsonl.trade(
+                                kind="cancel",
+                                ts=datetime.now(timezone.utc),
+                                symbol=symbol,
+                                tick=tick_count,
+                                order_update=upd,
+                                order_id=upd_order_id,
+                                source="order_updates",
+                                status=upd_status,
+                                local_placeholder=is_local_cancel,
+                                startup_sync=tick_is_startup_sync,
+                            )
 
 
             # 2) poll newly filled orders from execution and forward to strategy
@@ -1214,7 +1260,6 @@ async def run_loop(*, symbol: str, strategy: Any, max_ticks: int = 0) -> None:
                     if fill_key in seen_fill_keys:
                         continue
                     seen_fill_keys.add(fill_key)
-                    is_startup_sync = startup_sync_polls_left > 0
                     fill_order_id = _extract_order_id(fill)
                     fill_status = _extract_fill_status(fill)    
                     fill_qty_dec = _extract_fill_qty(fill)
@@ -1222,7 +1267,7 @@ async def run_loop(*, symbol: str, strategy: Any, max_ticks: int = 0) -> None:
                         logger.info(
                             "SKIP_ZERO_FILL order_id={} qty={} source=live_poll",
                             (fill_order_id or "?"),
-                            _fmt_log_val(fill_qty_dec),
+                            _fmt_qty(fill_qty_dec),
                         )
                         continue
                     
@@ -1255,7 +1300,7 @@ async def run_loop(*, symbol: str, strategy: Any, max_ticks: int = 0) -> None:
                     if fill_order_id:
                         order_last_status[fill_order_id] = "PARTIALLY_FILLED" if is_partial else "FILLED"    
 
-                    if not is_startup_sync:
+                    if not tick_is_startup_sync:
                         _call_strategy_hook(strategy, "on_fill", broker=execution, fill=fill_for_strategy)
                         runtime_stats["strategy_on_fill_calls"] = int(runtime_stats.get("strategy_on_fill_calls", 0)) + 1
                         runtime_stats["fills_total"] = int(runtime_stats.get("fills_total", 0)) + 1
@@ -1280,14 +1325,14 @@ async def run_loop(*, symbol: str, strategy: Any, max_ticks: int = 0) -> None:
                         "FILL {} {} qty={} price={} fee_quote={} maker={} order_id={} status={}{} source={} ts={}",
                         fill_symbol,
                         fill_side,
-                        _fmt_log_val(fill_qty_disp),
+                        _fmt_qty(fill_qty_disp),
                         _fmt_log_val(fill_price),
                         _fmt_log_val(fill_fee),
                         fill_maker,
                         (fill_order_id or "?"),
                         (fill_status or "?"),
                         partial_marker,
-                        ("startup_sync" if is_startup_sync else "live_poll"),
+                        ("startup_sync" if tick_is_startup_sync else "live_poll"),
                         (fill_ts.isoformat() if isinstance(fill_ts, datetime) else fill_ts),
                     )
                     jsonl.trade(
@@ -1302,11 +1347,17 @@ async def run_loop(*, symbol: str, strategy: Any, max_ticks: int = 0) -> None:
                     )
             
             # Mark startup sync as completed after first N polling cycles.
-            if startup_sync_polls_left > 0:
+            if tick_is_startup_sync:
                 startup_sync_polls_left -= 1
                 if startup_sync_polls_left == 0:
                     runtime_stats["startup_sync_done"] = True
-                    logger.info("STARTUP_SYNC complete")
+                    logger.info(
+                        "STARTUP_SYNC complete | suppressed_cancel_logs[startup={} local={}] | log_startup_cancels={} log_local_cancels={}",
+                        suppressed_startup_cancel_logs,
+                        suppressed_local_cancel_logs,
+                        log_startup_cancel_events,
+                        log_local_cancel_events,
+                    )
 
             # 3) build synthetic 15m bars from mid and emit on close
             closed_bar = None
@@ -1377,20 +1428,54 @@ async def run_loop(*, symbol: str, strategy: Any, max_ticks: int = 0) -> None:
                     # LOCAL-* — это локальные placeholder id (pending submit / dedupe),
                     # их исчезновение НЕ должно вызывать on_cancel() у стратегии.
                     if is_local_cancel:
-                        logger.info(
-                            "CANCEL order_id={} source=open_orders_diff local=True ignored_for_strategy",
-                            canceled_order_id,
-                        )
-                        jsonl.trade(
-                            kind="cancel",
-                            ts=datetime.now(timezone.utc),
-                            symbol=symbol,
-                            tick=tick_count,
-                            order_id=canceled_order_id,
-                            source="open_orders_diff",
-                            local_placeholder=True,
-                            ignored_for_strategy=True,
-                        )
+                        emit_local_cancel_log = True
+                        if not log_local_cancel_events:
+                            emit_local_cancel_log = False
+                            suppressed_local_cancel_logs += 1
+                        if tick_is_startup_sync and not log_startup_cancel_events:
+                            emit_local_cancel_log = False
+                            suppressed_startup_cancel_logs += 1
+
+                        if emit_local_cancel_log:
+                            logger.info(
+                                "CANCEL order_id={} source=open_orders_diff local=True startup_sync={} ignored_for_strategy",
+                                canceled_order_id,
+                                tick_is_startup_sync,
+                            )
+                            jsonl.trade(
+                                kind="cancel",
+                                ts=datetime.now(timezone.utc),
+                                symbol=symbol,
+                                tick=tick_count,
+                                order_id=canceled_order_id,
+                                source="open_orders_diff",
+                                local_placeholder=True,
+                                startup_sync=tick_is_startup_sync,
+                                ignored_for_strategy=True,
+                            )
+                        continue
+
+                    # Startup sync can contain historical disappear events.
+                    # Do not propagate them to strategy/on-cancel counters by default.
+                    if tick_is_startup_sync:
+                        if log_startup_cancel_events:
+                            logger.info(
+                                "CANCEL order_id={} source=open_orders_diff startup_sync=True ignored_for_strategy",
+                                canceled_order_id,
+                            )
+                            jsonl.trade(
+                                kind="cancel",
+                                ts=datetime.now(timezone.utc),
+                                symbol=symbol,
+                                tick=tick_count,
+                                order_id=canceled_order_id,
+                                source="open_orders_diff",
+                                startup_sync=True,
+                                local_placeholder=False,
+                                ignored_for_strategy=True,
+                            )
+                        else:
+                            suppressed_startup_cancel_logs += 1
                         continue
 
                     canceled_total += 1
