@@ -24,6 +24,8 @@
 - `src/strategy/grid_core.py` — чистая механика сетки.
 - `src/strategy/grid_types.py` — типы и состояние стратегии.
 - `src/strategy/grid_paper_adapter.py` — сборка synthetic свечей из тиков для заданного интервала.
+- `deploy/systemd/crypto-bot.service` — шаблон `systemd`-сервиса.
+- `scripts/install_systemd_service.sh` — установка/включение сервиса на VPS.
 
 ## Быстрый старт
 
@@ -62,9 +64,9 @@ S3-бэкапы (опционально, для state/logs):
 RUN_DEMO_GRID_S3_ENABLED=1
 RUN_DEMO_GRID_S3_ENDPOINT=https://s3.twcstorage.ru
 RUN_DEMO_GRID_S3_REGION=ru-1
-RUN_DEMO_GRID_S3_BUCKET=1ddf608c-461a-4387-bcdb-b378a99c8075
-RUN_DEMO_GRID_S3_ACCESS_KEY=S545TAWWV9PPA1R6CIPQ
-RUN_DEMO_GRID_S3_SECRET_KEY=cUSfVMFfNBAdQ0LgRTVsfvHo6qCUi6R0q9HnSN9a
+RUN_DEMO_GRID_S3_BUCKET=<bucket_name>
+RUN_DEMO_GRID_S3_ACCESS_KEY=<access_key>
+RUN_DEMO_GRID_S3_SECRET_KEY=<secret_key>
 RUN_DEMO_GRID_S3_PREFIX=demo-grid
 # 0 = не грузить jsonl логи периодически (только финальная выгрузка при остановке)
 RUN_DEMO_GRID_S3_LOG_SYNC_SEC=0
@@ -83,6 +85,48 @@ RUN_DEMO_GRID_S3_LOG_SYNC_SEC=0
 make demo SYMBOL=ETHUSDT INTERVAL=15m
 make demo_once        # max-ticks=1
 make demo_fresh       # удалить state и стартовать "с нуля"
+```
+
+### 4) Deploy на VPS (Ubuntu 22.04+)
+
+На сервере:
+
+```bash
+sudo apt update
+sudo apt install -y git python3 python3-venv python3-pip
+sudo mkdir -p /opt
+sudo chown $USER:$USER /opt
+cd /opt
+git clone git@github.com:bXnxme/crypto-bot.git
+cd crypto-bot
+python3 -m venv .venv
+./.venv/bin/pip install -r requirements.txt
+cp .env.example .env
+# заполни .env своими ключами Binance/S3
+sudo REPO_DIR=/opt/crypto-bot RUN_USER=$USER RUN_GROUP=$(id -gn) ./scripts/install_systemd_service.sh
+```
+
+Проверка:
+
+```bash
+sudo systemctl status crypto-bot --no-pager
+sudo journalctl -u crypto-bot -f
+```
+
+Смена пары/интервала без правки unit:
+
+```bash
+sudo nano /etc/default/crypto-bot-runner
+sudo systemctl restart crypto-bot
+```
+
+Обновление бота на VPS:
+
+```bash
+cd /opt/crypto-bot
+git pull --rebase
+./.venv/bin/pip install -r requirements.txt
+sudo systemctl restart crypto-bot
 ```
 
 ## State и логи

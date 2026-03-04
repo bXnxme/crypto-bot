@@ -1,0 +1,26 @@
+[Unit]
+Description=Crypto Bot Demo Grid Runner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+Group=__GROUP__
+WorkingDirectory=__WORKDIR__
+EnvironmentFile=__WORKDIR__/.env
+EnvironmentFile=-/etc/default/crypto-bot-runner
+Environment=SYMBOL=ETHUSDT
+Environment=INTERVAL=1m
+Environment=LOG_LEVEL=INFO
+ExecStart=__WORKDIR__/.venv/bin/python -m src.run_demo --symbol ${SYMBOL} --interval ${INTERVAL} --max-ticks 0 --log-level ${LOG_LEVEL}
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=20
+StandardOutput=journal
+StandardError=journal
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
