@@ -13,7 +13,7 @@ STATE_FILE ?= data/run_demo_grid_state.json
 
 RUN_DEMO_ARGS := --symbol $(SYMBOL) --interval $(INTERVAL) --max-ticks $(MAX_TICKS) --log-level $(LOG_LEVEL) $(EXTRA)
 
-.PHONY: help venv install demo demo_once demo_fresh demo_state clean_logs smoke_imports
+.PHONY: help venv install demo demo_once demo_fresh demo_state telegram miniapp clean_logs smoke_imports
 
 help:
 	@echo "Targets:"
@@ -23,6 +23,8 @@ help:
 	@echo "  make demo_once             # run one tick cycle (MAX_TICKS=1)"
 	@echo "  make demo_fresh            # remove saved state then run demo"
 	@echo "  make demo_state            # print current state file path/content (if exists)"
+	@echo "  make telegram              # run Telegram control bot"
+	@echo "  make miniapp               # run Telegram Mini App web server"
 	@echo "  make clean_logs            # delete demo JSONL logs from logs/"
 	@echo "  make smoke_imports         # quick import smoke check"
 	@echo ""
@@ -55,9 +57,15 @@ demo_state:
 	@echo "State file: $(STATE_FILE)"
 	@if [ -f "$(STATE_FILE)" ]; then cat "$(STATE_FILE)"; else echo "State file does not exist"; fi
 
+telegram:
+	$(PYTHON) -m src.telegram_bot
+
+miniapp:
+	$(PYTHON) -m src.telegram_miniapp
+
 clean_logs:
 	@rm -f logs/demo_grid_*_quotes.jsonl logs/demo_grid_*_trades.jsonl logs/demo_grid_*_metrics.jsonl
 	@echo "Deleted demo JSONL logs (if existed)"
 
 smoke_imports:
-	$(PYTHON) -c "import importlib; mods=['src.run_demo','src.demo_execution','src.binance_ws','src.strategy.grid_core','src.strategy.grid_types','src.strategy.grid_backtest_adapter','src.strategy.grid_paper_adapter']; [importlib.import_module(m) and print('ok', m) for m in mods]"
+	$(PYTHON) -c "import importlib; mods=['src.run_demo','src.telegram_bot','src.telegram_miniapp','src.demo_execution','src.binance_ws','src.strategy.grid_core','src.strategy.grid_types','src.strategy.grid_backtest_adapter','src.strategy.grid_paper_adapter']; [importlib.import_module(m) and print('ok', m) for m in mods]"

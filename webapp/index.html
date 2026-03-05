@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>Crypto Bot Mini App</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+</head>
+<body>
+  <main class="app">
+    <header class="topbar card">
+      <div class="brand">
+        <div class="avatar">
+          <img src="/static/assets/topbar-logo-cropped-256.png" alt="ebec logo" class="brand-logo" />
+        </div>
+        <div>
+          <p class="muted tiny">Crypto Bot</p>
+          <h1>ebec</h1>
+        </div>
+      </div>
+      <div class="top-actions">
+        <span id="symbol" class="pair-pill">-</span>
+        <button id="refreshBtn" class="icon-btn" type="button" aria-label="Refresh">↻</button>
+      </div>
+    </header>
+
+    <section class="runner card">
+      <div class="row head">
+        <h2>Runner Status</h2>
+        <span id="runnerState" class="pill pill-neutral">loading</span>
+      </div>
+      <div class="runner-grid">
+        <div class="cell">
+          <p class="muted">Exchange</p>
+          <strong id="exchange">-</strong>
+        </div>
+        <div class="cell">
+          <p class="muted">Ticks/s</p>
+          <strong id="ticksPerSec">-</strong>
+        </div>
+        <div class="cell">
+          <p class="muted">Saved state</p>
+          <strong id="savedAt">-</strong>
+        </div>
+        <div class="cell">
+          <p class="muted">Last update</p>
+          <strong id="lastUpdate">-</strong>
+        </div>
+      </div>
+    </section>
+
+    <section class="balance-wrap">
+      <h2 class="section-title">Balance</h2>
+      <div class="summary-grid">
+        <article class="balance-card quote card">
+          <div class="row">
+            <h3>Quote</h3>
+            <span class="chip">USDT</span>
+          </div>
+          <p class="value" id="quoteBalance">-</p>
+          <p class="muted">Available: <strong id="quoteAvailable">-</strong></p>
+        </article>
+        <article class="balance-card base card">
+          <div class="row">
+            <h3>Base</h3>
+            <span class="chip" id="baseAsset">BASE</span>
+          </div>
+          <p class="value" id="baseBalance">-</p>
+          <p class="muted">Available: <strong id="baseAvailable">-</strong></p>
+        </article>
+      </div>
+      <div class="kpi-grid">
+        <article class="metric-card total card accent">
+          <p class="muted">Total Balance (USDT)</p>
+          <p class="metric-value" id="totalBalance">-</p>
+        </article>
+        <article class="metric-card pnl card dark">
+          <p class="muted">Day PnL</p>
+          <p class="metric-value" id="pnlDay">-</p>
+          <p class="muted"><span id="pnlDayPct">-</span></p>
+        </article>
+      </div>
+      <section class="counts card">
+        <div class="count-item">
+          <span class="muted">Open Orders</span>
+          <strong id="openOrders">-</strong>
+        </div>
+        <div class="count-item">
+          <span class="muted">Open Positions</span>
+          <strong id="openLots">-</strong>
+        </div>
+        <div class="count-item">
+          <span class="muted">Service</span>
+          <strong id="serviceName">-</strong>
+        </div>
+        <div class="count-item">
+          <span class="muted">Tick Count</span>
+          <strong id="tickCount">-</strong>
+        </div>
+      </section>
+    </section>
+
+    <section class="actions card">
+      <button data-action="stop" class="btn btn-stop" type="button">STOP</button>
+      <div class="actions-row">
+        <button data-action="start" class="btn btn-soft" type="button">Start</button>
+        <button data-action="restart" class="btn btn-soft" type="button">Restart</button>
+      </div>
+      <pre id="actionOutput" class="console">Waiting for command…</pre>
+    </section>
+
+    <section class="tabs card">
+      <div class="tabbar">
+        <button class="tab-btn active" data-tab="activity" type="button">Activity</button>
+        <button class="tab-btn" data-tab="positions" type="button">Positions</button>
+        <button class="tab-btn" data-tab="orders" type="button">Orders</button>
+      </div>
+
+      <div class="tab-panel active" data-panel="activity">
+        <div class="panel-head-row">
+          <h3>Executions</h3>
+          <small id="tradesSource">source: -</small>
+        </div>
+        <div class="table-wrap">
+          <table class="activity-table">
+            <thead>
+              <tr>
+                <th>Side</th>
+                <th>Qty</th>
+                <th>Price</th>
+                <th>Fee</th>
+                <th>Status</th>
+                <th>Time</th>
+              </tr>
+            </thead>
+            <tbody id="tradesTableBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="tab-panel" data-panel="positions">
+        <div class="panel-head-row">
+          <h3>Open Positions</h3>
+        </div>
+        <div id="positionsList" class="items-grid"></div>
+      </div>
+
+      <div class="tab-panel" data-panel="orders">
+        <div class="panel-head-row">
+          <h3>Open Orders</h3>
+        </div>
+        <div id="ordersList" class="items-grid"></div>
+      </div>
+    </section>
+  </main>
+
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>

@@ -1317,6 +1317,16 @@ async def run_loop(*, symbol: str, strategy: Any, interval: str = "15m", max_tic
     last_seen_ask: Decimal | None = None
 
     known_open_order_ids: set[str] = _extract_open_order_ids(getattr(execution, "open_orders", None))
+    # Keep a short grace before treating "disappeared from open_orders" as cancel.
+    # Exchange snapshots can be temporarily stale/incomplete between refresh cycles.
+    open_order_missing_since_mono: dict[str, float] = {}
+    open_order_diff_grace_sec = float(os.getenv("RUN_DEMO_GRID_OPEN_ORDERS_DIFF_GRACE_SEC", "6.0"))
+    # Conservative default: open_orders diff is telemetry-only unless explicitly enabled.
+    # Real cancel propagation should primarily come from explicit order updates.
+    open_order_diff_strategy_cancel = _env_flag(
+        "RUN_DEMO_GRID_OPEN_ORDERS_DIFF_STRATEGY_CANCEL",
+        default=False,
+    )
     order_filled_qty: dict[str, Decimal] = {}
     order_last_status: dict[str, str] = {}
     canceled_total = 0
@@ -1434,6 +1444,9 @@ async def run_loop(*, symbol: str, strategy: Any, interval: str = "15m", max_tic
                     upd_side = getattr(upd, "side", "?") if not isinstance(upd, dict) else upd.get("side", "?")
                     upd_price = getattr(upd, "price", "?") if not isinstance(upd, dict) else upd.get("price", "?")
                     upd_ts = getattr(upd, "ts", datetime.now(timezone.utc)) if not isinstance(upd, dict) else upd.get("ts", datetime.now(timezone.utc))
+
+                    if upd_order_id:
+                        open_order_missing_since_mono.pop(upd_order_id, None)
 
                     if upd_order_id and upd_status != "?":
                         order_last_status[upd_order_id] = upd_status
@@ -1554,6 +1567,8 @@ async def run_loop(*, symbol: str, strategy: Any, interval: str = "15m", max_tic
                     seen_fill_keys.add(fill_key)
                     fill_order_id = _extract_order_id(fill)
                     fill_status = _extract_fill_status(fill)    
+                    if fill_order_id:
+                        open_order_missing_since_mono.pop(fill_order_id, None)
                     fill_qty_dec = _extract_fill_qty(fill)
                     if fill_qty_dec is not None and fill_qty_dec <= Decimal("0"):
                         logger.info(
@@ -1632,6 +1647,12 @@ async def run_loop(*, symbol: str, strategy: Any, interval: str = "15m", max_tic
                         ts=datetime.now(timezone.utc),
                         symbol=symbol,
                         tick=tick_count,
+                        side=fill_side,
+                        qty=fill_qty_disp,
+                        price=fill_price,
+                        fee_quote=fill_fee,
+                        maker=fill_maker,
+                        fill_ts=fill_ts,
                         fill=fill,
                         order_id=fill_order_id,
                         fill_status=fill_status,
@@ -1702,6 +1723,8 @@ async def run_loop(*, symbol: str, strategy: Any, interval: str = "15m", max_tic
 
             # 4) detect order cancellations/removals by diffing open order ids (best effort)
             current_open_order_ids = _extract_open_order_ids(getattr(execution, "open_orders", None))
+            for open_oid in current_open_order_ids:
+                open_order_missing_since_mono.pop(open_oid, None)
             disappeared_order_ids = sorted(known_open_order_ids - current_open_order_ids)
             if disappeared_order_ids:
                 for canceled_order_id in disappeared_order_ids:
@@ -1709,12 +1732,35 @@ async def run_loop(*, symbol: str, strategy: Any, interval: str = "15m", max_tic
 
                     # already processed cancel
                     if last_status == "CANCELED":
+                        open_order_missing_since_mono.pop(canceled_order_id, None)
                         continue
 
                     # if we saw fills, disappearance is expected (FILLED orders vanish from open_orders)
                     if last_status in {"FILLED", "PARTIALLY_FILLED"}:
+                        open_order_missing_since_mono.pop(canceled_order_id, None)
                         continue
                     if order_filled_qty.get(canceled_order_id, Decimal("0")) > 0:
+                        open_order_missing_since_mono.pop(canceled_order_id, None)
+                        continue
+
+                    if open_order_diff_grace_sec > 0:
+                        miss_since = open_order_missing_since_mono.get(canceled_order_id)
+                        if miss_since is None:
+                            open_order_missing_since_mono[canceled_order_id] = now_mono
+                            continue
+                        if (now_mono - miss_since) < open_order_diff_grace_sec:
+                            continue
+                        open_order_missing_since_mono.pop(canceled_order_id, None)
+
+                    if open_order_diff_grace_sec <= 0:
+                        open_order_missing_since_mono.pop(canceled_order_id, None)
+
+                    if not last_status:
+                        # Ignore unknown-status disappearances; wait for explicit updates.
+                        continue
+
+                    if last_status == "NEW":
+                        # Don't force-cancel right after NEW; wait for explicit status updates.
                         continue
 
                     is_local_cancel = _is_local_order_id(canceled_order_id)
@@ -1772,9 +1818,27 @@ async def run_loop(*, symbol: str, strategy: Any, interval: str = "15m", max_tic
                             suppressed_startup_cancel_logs += 1
                         continue
 
+                    if not open_order_diff_strategy_cancel:
+                        logger.debug(
+                            "CANCEL order_id={} source=open_orders_diff ignored_for_strategy reason=diff_strategy_cancel_disabled",
+                            canceled_order_id,
+                        )
+                        jsonl.trade(
+                            kind="cancel",
+                            ts=datetime.now(timezone.utc),
+                            symbol=symbol,
+                            tick=tick_count,
+                            order_id=canceled_order_id,
+                            source="open_orders_diff",
+                            local_placeholder=False,
+                            ignored_for_strategy=True,
+                        )
+                        continue
+
                     canceled_total += 1
                     logger.info("CANCEL order_id={} source=open_orders_diff", canceled_order_id)
                     _call_strategy_hook(strategy, "on_cancel", broker=execution, order_id=canceled_order_id)
+                    order_last_status[canceled_order_id] = "CANCELED"
                     jsonl.trade(
                         kind="cancel",
                         ts=datetime.now(timezone.utc),

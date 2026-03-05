@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timedelta, timezone
+import os
 import re
 from typing import Any, Optional, Callable
 
@@ -95,7 +96,7 @@ class GridBacktestAdapter:
         *,
         symbol: str,
         interval: str = "15m",
-        grid_step_pct: Decimal = Decimal("0.001"),
+        grid_step_pct: Decimal = Decimal("0.005"),
         grid_n_buy: int = 5,
         spend_quote: Decimal = Decimal("2"),
         spend_pct_of_quote: Optional[Decimal] = Decimal("0.1"),
@@ -107,7 +108,7 @@ class GridBacktestAdapter:
         grid_reanchor_up: bool = True,
         grid_reanchor_down: bool = True,
         grid_reanchor_trigger_steps: int = 2,
-        grid_sell_only_above_cost: bool = False,
+        grid_sell_only_above_cost: bool = True,
         grid_min_sell_markup_pct: Decimal = Decimal("0"),
         slippage_pct: Decimal = Decimal("0"),
         fill_epsilon_pct: Decimal = Decimal("0"),
@@ -240,12 +241,32 @@ class GridBacktestAdapter:
         self._planned_qty_by_order_ref: dict[str, Decimal] = {}
 
         # Recovery safety: wallet-based lot synthesis can race with delayed trade polling.
-        # Keep enabled, but guarded by strict conditions in _recover_missing_open_lots_from_base().
-        self._enable_runtime_lot_recovery: bool = True
+        # Disabled by default: synthesized lots can produce off-grid SELL orders.
+        # Opt-in via env RUN_DEMO_GRID_ENABLE_LOT_RECOVERY=1.
+        self._enable_runtime_lot_recovery: bool = str(
+            os.getenv("RUN_DEMO_GRID_ENABLE_LOT_RECOVERY", "0")
+        ).strip().lower() in {"1", "true", "yes", "on"}
         self._lot_recovery_cooldown_after_fill_seconds: int = 30
         # If an order is already closed on exchange but we only saw part of its trade fragments,
         # wait a short grace period for remaining fragments before forced accumulator finalization.
         self._fill_accum_finalize_grace_seconds: int = 3
+        # Guard against tiny BUY orders when free quote is temporarily stale/low.
+        # Example: 0.20 means spend must be at least 20% of intended spend.
+        try:
+            self._buy_spend_degrade_min_ratio: Decimal = _d(
+                os.getenv("RUN_DEMO_GRID_BUY_SPEND_MIN_RATIO", "0.20")
+            )
+        except Exception:
+            self._buy_spend_degrade_min_ratio = Decimal("0.20")
+        if self._buy_spend_degrade_min_ratio < 0:
+            self._buy_spend_degrade_min_ratio = Decimal("0")
+        if self._buy_spend_degrade_min_ratio > 1:
+            self._buy_spend_degrade_min_ratio = Decimal("1")
+        # Strict mode: percent-based BUY spend is either fully placeable or skipped.
+        # Prevents undersized BUY orders when wallet/open-order snapshots are temporarily out of sync.
+        self._strict_spend_pct: bool = str(
+            os.getenv("RUN_DEMO_GRID_STRICT_SPEND_PCT", "1")
+        ).strip().lower() in {"1", "true", "yes", "on"}
 
         # Diagnostics
         self.fills_buy = 0
@@ -1579,6 +1600,22 @@ class GridBacktestAdapter:
                 broker,
                 desired_orders=max(1, _active_buy_slots_left()),
             )
+            intended_spend = self._target_spend_quote_uncapped(broker)
+            min_ratio = _d(getattr(self, "_buy_spend_degrade_min_ratio", Decimal("0")))
+            if (
+                intended_spend > 0
+                and min_ratio > 0
+                and spend_target < (intended_spend * min_ratio)
+            ):
+                self.cap_blocked += 1
+                logger.debug(
+                    "GRID_PLACE skip | side=BUY px={} reason=spend_degraded spend_target={} intended_spend={} min_ratio={}",
+                    bp_place,
+                    spend_target,
+                    intended_spend,
+                    min_ratio,
+                )
+                continue
 
             # If target spend is non-positive -> no order.
             if spend_target <= 0:
@@ -1712,6 +1749,21 @@ class GridBacktestAdapter:
 
         self._core.state.quote = quote_cash
         self._core.state.base = base_qty
+        st = self._core.state
+        try:
+            if hasattr(st, "initial_quote"):
+                initial_quote_now = _d(getattr(st, "initial_quote", Decimal("0")))
+                if initial_quote_now <= 0:
+                    quote_total = self._broker_quote_total(broker)
+                    seed = quote_total if quote_total > 0 else quote_cash
+                    if seed > 0:
+                        st.initial_quote = seed
+            if hasattr(st, "deposits_total"):
+                deposits_now = _d(getattr(st, "deposits_total", Decimal("0")))
+                if deposits_now < 0:
+                    st.deposits_total = Decimal("0")
+        except Exception:
+            pass
 
     def _drop_excess_open_lots_from_base(self, broker: Any) -> None:
         """Drop stale strategy lots when tracked base exceeds broker base snapshot.
@@ -2194,24 +2246,14 @@ class GridBacktestAdapter:
         if desired_orders_i <= 0:
             desired_orders_i = 1
 
-        total_capital_quote = self._total_capital_in_quote(broker)
-        if total_capital_quote <= 0:
-            return Decimal("0")
-
-        target_spend_net = total_capital_quote * self.spend_pct_of_quote
+        target_spend_net = self._target_spend_quote_uncapped(broker)
         if target_spend_net <= 0:
             return Decimal("0")
 
-        quote_cash_total = self._broker_quote_cash(broker)
-        quote_total = self._broker_quote_total(broker)
-
-        if quote_total > quote_cash_total:
-            available_quote = quote_cash_total
-        else:
-            reserved_quote = self._reserved_quote_in_pending_buys(broker)
-            available_quote = quote_cash_total - reserved_quote
-            if available_quote < 0:
-                available_quote = Decimal("0")
+        # Use free quote cash only; execution adapter already exposes free balance here.
+        available_quote = self._broker_quote_cash(broker)
+        if available_quote < 0:
+            available_quote = Decimal("0")
 
         if available_quote <= 0:
             return Decimal("0")
@@ -2224,6 +2266,14 @@ class GridBacktestAdapter:
         if max_spend_net_placeable <= 0:
             return Decimal("0")
 
+        if self._strict_spend_pct:
+            tol = target_spend_net * Decimal("0.000001")
+            if tol < Decimal("0.00000001"):
+                tol = Decimal("0.00000001")
+            if max_spend_net_placeable + tol < target_spend_net:
+                return Decimal("0")
+            return target_spend_net
+
         per_order_cap = max_spend_net_placeable / Decimal(desired_orders_i)
         if per_order_cap <= 0:
             return Decimal("0")
@@ -2231,6 +2281,39 @@ class GridBacktestAdapter:
         if target_spend_net > per_order_cap:
             return per_order_cap
         return target_spend_net
+
+    def _spend_capital_basis_in_quote(self, broker: Any = None) -> Decimal:
+        """Prefer contributed-capital basis for percent spend sizing when available."""
+        if broker is None:
+            return Decimal("0")
+
+        try:
+            st = self._core.state
+            initial_quote = _d(getattr(st, "initial_quote", Decimal("0")))
+            deposits_total = _d(getattr(st, "deposits_total", Decimal("0")))
+            basis = initial_quote + deposits_total
+            if basis > 0:
+                return basis
+        except Exception:
+            pass
+
+        manual_basis = _d(getattr(self, "manual_deposits_total", Decimal("0")))
+        if manual_basis > 0:
+            return manual_basis
+
+        return self._total_capital_in_quote(broker)
+
+    def _target_spend_quote_uncapped(self, broker: Any = None) -> Decimal:
+        """Configured per-order spend before free-quote capping."""
+        if self.spend_pct_of_quote is None:
+            return self.spend_quote
+        if broker is None:
+            return Decimal("0")
+        basis_quote = self._spend_capital_basis_in_quote(broker)
+        if basis_quote <= 0:
+            return Decimal("0")
+        target = basis_quote * self.spend_pct_of_quote
+        return target if target > 0 else Decimal("0")
 
 
     def _reserved_base_in_open_sells(self, broker: Any) -> Decimal:
@@ -2310,24 +2393,14 @@ class GridBacktestAdapter:
         return qty
 
     def _can_add_base(self, broker: Any) -> bool:
-        total_capital_quote = self._total_capital_in_quote(broker)
-        spend_target = self.spend_quote
-        if self.spend_pct_of_quote is not None:
-            spend_target = total_capital_quote * self.spend_pct_of_quote
+        spend_target = self._target_spend_quote_uncapped(broker)
 
         if spend_target <= 0:
             return False
 
-        quote_cash = self._broker_quote_cash(broker)
-        quote_total = self._broker_quote_total(broker)
-
-        if quote_total > quote_cash:
-            available_quote = quote_cash
-        else:
-            reserved_quote = self._reserved_quote_in_pending_buys(broker)
-            available_quote = quote_cash - reserved_quote
-            if available_quote < 0:
-                available_quote = Decimal("0")
+        available_quote = self._broker_quote_cash(broker)
+        if available_quote < 0:
+            available_quote = Decimal("0")
 
         need = spend_target * (Decimal("1") + self.maker_fee_rate)
         return available_quote >= need
