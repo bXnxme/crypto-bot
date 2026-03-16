@@ -56,6 +56,13 @@ let latestStatus = null;
 let latestTrades = null;
 let activeTab = "activity";
 
+function setText(el, value) {
+  if (!el) {
+    return;
+  }
+  el.textContent = value;
+}
+
 function esc(input) {
   return String(input ?? "")
     .replaceAll("&", "&amp;")
@@ -149,6 +156,9 @@ function fillStatusRu(statusRaw) {
 
 function setRunnerPill(stateRaw) {
   const key = String(stateRaw || "unknown").trim().toLowerCase();
+  if (!els.runnerState) {
+    return;
+  }
   els.runnerState.textContent = runnerStateRu(key);
   els.runnerState.className = "pill";
   if (key === "active") {
@@ -230,38 +240,38 @@ function renderStatus(payload) {
   const baseAsset = detectBaseAsset(symbol);
 
   setRunnerPill(service.state);
-  els.serviceName.textContent = fmt(service.name);
-  els.symbol.textContent = symbol;
-  els.exchange.textContent = fmt(st.exchange);
-  els.tickCount.textContent = fmtCount(st.tick_count);
-  els.ticksPerSec.textContent = isMissing(st.ticks_ps) ? "-" : `${fmtNumber(st.ticks_ps, 2)} /s`;
-  els.savedAt.textContent = fmtDateTime(st.saved_at);
-  els.lastUpdate.textContent = fmtDateTime(st.last_update_ts);
+  setText(els.serviceName, fmt(service.name));
+  setText(els.symbol, symbol);
+  setText(els.exchange, fmt(st.exchange));
+  setText(els.tickCount, fmtCount(st.tick_count));
+  setText(els.ticksPerSec, isMissing(st.ticks_ps) ? "-" : `${fmtNumber(st.ticks_ps, 2)} /s`);
+  setText(els.savedAt, fmtDateTime(st.saved_at));
+  setText(els.lastUpdate, fmtDateTime(st.last_update_ts));
 
-  els.quoteBalance.textContent = fmtMoney(st.quote_balance);
-  els.quoteAvailable.textContent = fmtMoney(st.quote_balance_free);
-  els.baseBalance.textContent = fmtNumber(st.base_balance);
-  els.baseAvailable.textContent = fmtNumber(st.base_balance_free);
-  els.baseAsset.textContent = baseAsset;
+  setText(els.quoteBalance, fmtMoney(st.quote_balance));
+  setText(els.quoteAvailable, fmtMoney(st.quote_balance_free));
+  setText(els.baseBalance, fmtNumber(st.base_balance));
+  setText(els.baseAvailable, fmtNumber(st.base_balance_free));
+  setText(els.baseAsset, baseAsset);
 
-  els.totalBalance.textContent = fmtMoney(st.total_balance_usdt);
+  setText(els.totalBalance, fmtMoney(st.total_balance_usdt));
   const dayValue = Number(st.pnl_day_usdt);
   const dayPct = Number(st.pnl_day_pct);
   if (Number.isFinite(dayValue)) {
     const sign = dayValue > 0 ? "+" : "";
-    els.pnlDay.textContent = `${sign}${fmtMoney(dayValue)} USDT`;
+    setText(els.pnlDay, `${sign}${fmtMoney(dayValue)} USDT`);
   } else {
-    els.pnlDay.textContent = "-";
+    setText(els.pnlDay, "-");
   }
   if (Number.isFinite(dayPct)) {
     const signPct = dayPct > 0 ? "+" : "";
-    els.pnlDayPct.textContent = `${signPct}${fmtNumber(dayPct, 2)}%`;
+    setText(els.pnlDayPct, `${signPct}${fmtNumber(dayPct, 2)}%`);
   } else {
-    els.pnlDayPct.textContent = "-";
+    setText(els.pnlDayPct, "-");
   }
   setPnlStyles(st.pnl_day_usdt);
 
-  els.openOrders.textContent = fmtCount(st.open_orders_count);
+  setText(els.openOrders, fmtCount(st.open_orders_count));
 
   renderOrdersTab();
 }
@@ -269,7 +279,7 @@ function renderStatus(payload) {
 function renderTrades(payload) {
   latestTrades = payload;
   const source = payload?.source ? String(payload.source) : "-";
-  els.tradesSource.textContent = `source: ${source}`;
+  setText(els.tradesSource, `source: ${source}`);
   renderActivityTab();
 }
 

@@ -645,7 +645,11 @@ class TelegramMiniAppServer:
         return web.json_response({"ok": True, "ts": datetime.now(timezone.utc).isoformat()})
 
     async def handle_index(self, _: web.Request) -> web.Response:
-        return web.FileResponse(self.static_dir / "index.html")
+        response = web.FileResponse(self.static_dir / "index.html")
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        return response
 
     async def handle_status(self, request: web.Request) -> web.Response:
         user = request.get("auth_user", {})
