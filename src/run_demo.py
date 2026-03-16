@@ -1341,6 +1341,9 @@ async def run_loop(*, symbol: str, strategy: Any, interval: str = "15m", max_tic
     # --- REST polling throttle / backoff ---
     poll_fills_every_sec = float(os.getenv("RUN_DEMO_GRID_POLL_FILLS_EVERY_SEC", "5.0"))
     poll_updates_every_sec = float(os.getenv("RUN_DEMO_GRID_POLL_UPDATES_EVERY_SEC", "10.0"))
+    # Keep execution balances fresh even without fills/cancels.
+    # Otherwise free quote/base can stay stale for a long time and block new BUY/SELL placement.
+    refresh_balances_every_sec = float(os.getenv("RUN_DEMO_GRID_REFRESH_BALANCES_EVERY_SEC", "5.0"))
     # Keep execution.open_orders fresh even without fills, so LOCAL-* placeholders expire
     # and adapter sync does not work on stale snapshots.
     refresh_open_orders_every_sec = float(os.getenv("RUN_DEMO_GRID_REFRESH_OPEN_ORDERS_EVERY_SEC", "2.0"))
@@ -1349,6 +1352,7 @@ async def run_loop(*, symbol: str, strategy: Any, interval: str = "15m", max_tic
     loop_mono = asyncio.get_running_loop().time
     next_poll_fills = loop_mono()
     next_poll_updates = loop_mono()
+    next_refresh_balances = loop_mono()
     next_refresh_open_orders = loop_mono()
 
     poll_backoff_sec = 0.0
@@ -1381,6 +1385,25 @@ async def run_loop(*, symbol: str, strategy: Any, interval: str = "15m", max_tic
                 spread=(ask - bid),
                 tick=tick_count,
             )
+
+            # Keep free/locked balances fresh on a timer.
+            refresh_balances = getattr(execution, "refresh_balances", None)
+            if (
+                callable(refresh_balances)
+                and refresh_balances_every_sec > 0
+                and now_mono >= next_refresh_balances
+            ):
+                next_refresh_balances = now_mono + refresh_balances_every_sec + poll_backoff_sec
+                try:
+                    await _maybe_await(refresh_balances())
+                    if poll_backoff_sec > 0:
+                        poll_backoff_sec = max(0.0, poll_backoff_sec - 0.5)
+                except Exception as e:
+                    msg = str(e)
+                    if "-1003" in msg or "Too much request weight" in msg:
+                        poll_backoff_sec = min(max(poll_backoff_sec * 2.0, 5.0), poll_backoff_max_sec)
+                        next_refresh_balances = now_mono + refresh_balances_every_sec + poll_backoff_sec
+                    logger.warning("refresh_balances failed: {}", e)
 
             # Keep open-orders snapshot in sync on a timer (independent from fills/updates).
             refresh_open_orders = getattr(execution, "refresh_open_orders", None)
