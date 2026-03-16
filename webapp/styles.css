@@ -540,6 +540,14 @@ h1 {
   font-family: "JetBrains Mono", monospace;
 }
 
+.item-grid strong.position-exit-live {
+  color: #ffd4bd;
+}
+
+.item-grid strong.position-exit-missing {
+  color: #94a8c6;
+}
+
 .pnl-pos {
   color: var(--ok);
 }

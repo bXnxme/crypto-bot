@@ -247,9 +247,79 @@ class TelegramMiniAppServer:
         return rows
 
     @staticmethod
-    def _parse_position_rows(open_lots: Any, mark_price: Decimal) -> list[dict[str, Any]]:
+    def _step_guess(value: Any) -> Decimal:
+        raw = str(value or "").strip()
+        if not raw:
+            return Decimal("0")
+        if "." not in raw:
+            return Decimal("1")
+        frac = raw.split(".", 1)[1].rstrip("0")
+        if not frac:
+            return Decimal("1")
+        try:
+            return Decimal("1").scaleb(-len(frac))
+        except Exception:
+            return Decimal("0")
+
+    @classmethod
+    def _match_active_sell_order(
+        cls,
+        *,
+        sell_orders: list[dict[str, Any]],
+        used_indexes: set[int],
+        lot_qty: Decimal,
+        target_sell_price: Decimal,
+    ) -> dict[str, Any] | None:
+        best_idx: int | None = None
+        best_score: tuple[Decimal, Decimal] | None = None
+
+        for idx, order in enumerate(sell_orders):
+            if idx in used_indexes:
+                continue
+            order_qty = _to_decimal(order.get("origQty", order.get("orig_qty", order.get("qty", "0"))))
+            order_price = _to_decimal(order.get("price", order.get("limit_price", order.get("limit", order.get("px", "0")))))
+            if order_qty <= 0 or order_price <= 0:
+                continue
+
+            qty_tol = cls._step_guess(order.get("origQty", order.get("orig_qty", order.get("qty", "0"))))
+            if qty_tol <= 0:
+                qty_tol = cls._step_guess(str(lot_qty))
+            if qty_tol <= 0:
+                qty_tol = Decimal("0.0001")
+
+            price_tol = cls._step_guess(order.get("price", order.get("limit_price", order.get("limit", order.get("px", "0")))))
+            if price_tol <= 0:
+                price_tol = cls._step_guess(str(target_sell_price))
+            if price_tol <= 0:
+                price_tol = Decimal("0.01")
+
+            qty_diff = abs(order_qty - lot_qty)
+            price_diff = abs(order_price - target_sell_price)
+            if qty_diff > (qty_tol * Decimal("2")):
+                continue
+            if price_diff > (price_tol * Decimal("2")):
+                continue
+
+            score = (price_diff, qty_diff)
+            if best_score is None or score < best_score:
+                best_idx = idx
+                best_score = score
+
+        if best_idx is None:
+            return None
+
+        used_indexes.add(best_idx)
+        return sell_orders[best_idx]
+
+    @classmethod
+    def _parse_position_rows(cls, open_lots: Any, mark_price: Decimal, open_orders: Any) -> list[dict[str, Any]]:
         if not isinstance(open_lots, list):
             return []
+        sell_orders = [
+            o for o in (open_orders or [])
+            if isinstance(o, dict) and str(o.get("side", "")).upper() == "SELL"
+        ]
+        used_sell_indexes: set[int] = set()
         rows: list[dict[str, Any]] = []
         for idx, lot in enumerate(open_lots):
             if not isinstance(lot, dict):
@@ -266,6 +336,12 @@ class TelegramMiniAppServer:
             pnl_pct = Decimal("0")
             if cost_quote > 0:
                 pnl_pct = (pnl / cost_quote) * Decimal("100")
+            active_sell = cls._match_active_sell_order(
+                sell_orders=sell_orders,
+                used_indexes=used_sell_indexes,
+                lot_qty=qty,
+                target_sell_price=sell_price,
+            )
 
             rows.append(
                 {
@@ -278,6 +354,15 @@ class TelegramMiniAppServer:
                     "market_value": str(market_value) if market_value > 0 else None,
                     "pnl_quote": str(pnl) if market_value > 0 else None,
                     "pnl_pct": str(pnl_pct) if market_value > 0 else None,
+                    "exit_order_active": active_sell is not None,
+                    "exit_order_id": (
+                        str(active_sell.get("orderId", active_sell.get("order_id", active_sell.get("id", "?"))))
+                        if active_sell is not None else None
+                    ),
+                    "exit_order_price": (
+                        str(_to_decimal(active_sell.get("price", active_sell.get("limit_price", active_sell.get("limit", active_sell.get("px", "0"))))))
+                        if active_sell is not None else None
+                    ),
                 }
             )
         return rows
@@ -450,7 +535,7 @@ class TelegramMiniAppServer:
                 pnl_day_pct = (day_delta / eq_first) * Decimal("100")
 
         order_rows = self._parse_order_rows(open_orders_raw)
-        position_rows = self._parse_position_rows(open_lots_raw, mid)
+        position_rows = self._parse_position_rows(open_lots_raw, mid, open_orders_raw)
 
         out.update(
             {

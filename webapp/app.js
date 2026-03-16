@@ -322,6 +322,11 @@ function renderPositionsTab() {
     .map((p) => {
       const pnlNum = Number(p.pnl_quote);
       const pnlClass = Number.isFinite(pnlNum) ? (pnlNum >= 0 ? "pnl-pos" : "pnl-neg") : "";
+      const exitActive = Boolean(p.exit_order_active);
+      const exitText = exitActive
+        ? `Active @ ${fmtNumber(p.exit_order_price)}`
+        : "Not placed";
+      const exitClass = exitActive ? "position-exit-live" : "position-exit-missing";
       return `
         <article class="item">
           <div class="item-head">
@@ -331,9 +336,10 @@ function renderPositionsTab() {
           <div class="item-grid">
             <div>Qty<strong>${esc(fmtNumber(p.qty))}</strong></div>
             <div>Buy Price<strong>${esc(fmtNumber(p.buy_price))}</strong></div>
-            <div>Target Sell<strong>${esc(fmtNumber(p.target_sell_price))}</strong></div>
+            <div>Planned Exit<strong>${esc(fmtNumber(p.target_sell_price))}</strong></div>
             <div>Cost Basis<strong>${esc(fmtMoney(p.cost_quote))}</strong></div>
             <div>Market Price<strong>${esc(fmtNumber(p.mark_price))}</strong></div>
+            <div>Exit Order<strong class="${exitClass}">${esc(exitText)}</strong></div>
             <div>Return<strong class="${pnlClass}">${esc(isMissing(p.pnl_pct) ? "-" : `${fmtNumber(p.pnl_pct, 2)}%`)}</strong></div>
           </div>
         </article>
