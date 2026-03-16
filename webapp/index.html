@@ -87,10 +87,6 @@
           <strong id="openOrders">-</strong>
         </div>
         <div class="count-item">
-          <span class="muted">Open Positions</span>
-          <strong id="openLots">-</strong>
-        </div>
-        <div class="count-item">
           <span class="muted">Service</span>
           <strong id="serviceName">-</strong>
         </div>
@@ -113,7 +109,6 @@
     <section class="tabs card">
       <div class="tabbar">
         <button class="tab-btn active" data-tab="activity" type="button">Activity</button>
-        <button class="tab-btn" data-tab="positions" type="button">Positions</button>
         <button class="tab-btn" data-tab="orders" type="button">Orders</button>
       </div>
 
@@ -137,13 +132,6 @@
             <tbody id="tradesTableBody"></tbody>
           </table>
         </div>
-      </div>
-
-      <div class="tab-panel" data-panel="positions">
-        <div class="panel-head-row">
-          <h3>Open Positions</h3>
-        </div>
-        <div id="positionsList" class="items-grid"></div>
       </div>
 
       <div class="tab-panel" data-panel="orders">

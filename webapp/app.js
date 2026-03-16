@@ -42,12 +42,10 @@ const els = {
   pnlDay: document.getElementById("pnlDay"),
   pnlDayPct: document.getElementById("pnlDayPct"),
   openOrders: document.getElementById("openOrders"),
-  openLots: document.getElementById("openLots"),
   refreshBtn: document.getElementById("refreshBtn"),
   actionOutput: document.getElementById("actionOutput"),
   tradesSource: document.getElementById("tradesSource"),
   tradesTableBody: document.getElementById("tradesTableBody"),
-  positionsList: document.getElementById("positionsList"),
   ordersList: document.getElementById("ordersList"),
   actionButtons: Array.from(document.querySelectorAll("[data-action]")),
   tabButtons: Array.from(document.querySelectorAll("[data-tab]")),
@@ -264,9 +262,7 @@ function renderStatus(payload) {
   setPnlStyles(st.pnl_day_usdt);
 
   els.openOrders.textContent = fmtCount(st.open_orders_count);
-  els.openLots.textContent = fmtCount(st.open_lots_count);
 
-  renderPositionsTab();
   renderOrdersTab();
 }
 
@@ -310,45 +306,6 @@ function renderActivityTab() {
   els.tradesTableBody.innerHTML = rows;
 }
 
-function renderPositionsTab() {
-  const rows = Array.isArray(latestStatus?.state?.open_positions_rows)
-    ? latestStatus.state.open_positions_rows
-    : [];
-  if (!rows.length) {
-    els.positionsList.innerHTML = '<div class="item">No open positions.</div>';
-    return;
-  }
-  const html = rows
-    .map((p) => {
-      const pnlNum = Number(p.pnl_quote);
-      const pnlClass = Number.isFinite(pnlNum) ? (pnlNum >= 0 ? "pnl-pos" : "pnl-neg") : "";
-      const exitActive = Boolean(p.exit_order_active);
-      const exitText = exitActive
-        ? `Active @ ${fmtNumber(p.exit_order_price)}`
-        : "Not placed";
-      const exitClass = exitActive ? "position-exit-live" : "position-exit-missing";
-      return `
-        <article class="item">
-          <div class="item-head">
-            <strong>Lot #${esc(fmt(p.id))}</strong>
-            <span class="${pnlClass}">${Number.isFinite(pnlNum) ? `${pnlNum >= 0 ? "+" : ""}${fmtMoney(pnlNum)} USDT` : "-"}</span>
-          </div>
-          <div class="item-grid">
-            <div>Qty<strong>${esc(fmtNumber(p.qty))}</strong></div>
-            <div>Buy Price<strong>${esc(fmtNumber(p.buy_price))}</strong></div>
-            <div>Planned Exit<strong>${esc(fmtNumber(p.target_sell_price))}</strong></div>
-            <div>Cost Basis<strong>${esc(fmtMoney(p.cost_quote))}</strong></div>
-            <div>Market Price<strong>${esc(fmtNumber(p.mark_price))}</strong></div>
-            <div>Exit Order<strong class="${exitClass}">${esc(exitText)}</strong></div>
-            <div>Return<strong class="${pnlClass}">${esc(isMissing(p.pnl_pct) ? "-" : `${fmtNumber(p.pnl_pct, 2)}%`)}</strong></div>
-          </div>
-        </article>
-      `;
-    })
-    .join("");
-  els.positionsList.innerHTML = html;
-}
-
 function renderOrdersTab() {
   const rows = Array.isArray(latestStatus?.state?.open_orders_rows)
     ? latestStatus.state.open_orders_rows
@@ -379,12 +336,15 @@ function renderOrdersTab() {
 }
 
 function setActiveTab(tabName) {
-  activeTab = tabName;
+  const nextTab = els.tabButtons.some((btn) => btn.dataset.tab === tabName)
+    ? tabName
+    : "activity";
+  activeTab = nextTab;
   for (const btn of els.tabButtons) {
-    btn.classList.toggle("active", btn.dataset.tab === tabName);
+    btn.classList.toggle("active", btn.dataset.tab === nextTab);
   }
   for (const panel of els.tabPanels) {
-    panel.classList.toggle("active", panel.dataset.panel === tabName);
+    panel.classList.toggle("active", panel.dataset.panel === nextTab);
   }
 }
 
