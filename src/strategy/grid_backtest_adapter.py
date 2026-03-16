@@ -426,10 +426,12 @@ class GridBacktestAdapter:
         if self.step_size > 0:
             qty = _round_step(qty, self.step_size)
 
+        exec_ref = self._fill_exec_ref(fill)
         # If a polling bridge replays a completed order fill and there is no stable exec id,
         # do not let the strategy transition the same EXCHANGE order twice.
-        # NOTE: do not dedupe by client_order_id; LOCAL-* ids can be reused after restarts.
-        if order_ref is not None and str(order_ref) in self._finalized_fill_order_refs:
+        # When exec_ref exists, prefer exec-level dedupe so late fragments for the same order
+        # can still reach the strategy after an early partial finalization.
+        if order_ref is not None and str(order_ref) in self._finalized_fill_order_refs and exec_ref is None:
             return
 
         if qty <= 0 or px <= 0:
@@ -443,7 +445,6 @@ class GridBacktestAdapter:
         self._last_fill_ts = fill_seen_ts
 
         # Dedupe repeated fill callbacks (reconnect/polling bridges may replay the same fill)
-        exec_ref = self._fill_exec_ref(fill)
         if exec_ref is not None:
             if exec_ref in self._seen_fill_exec_refs:
                 return

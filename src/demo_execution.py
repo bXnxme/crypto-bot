@@ -155,6 +155,7 @@ class DemoFill:
     price: Decimal = Decimal("0")
     fee_quote: Decimal = Decimal("0")
     maker: bool = False
+    trade_id: Optional[str] = None
 
 
 @dataclass
@@ -952,6 +953,7 @@ class BinanceDemoExecution:
                     price=price,
                     fee_quote=fee_quote,
                     maker=maker,
+                    trade_id=(str(trade_id) if trade_id is not None else None),
                 )
 
                 try:
