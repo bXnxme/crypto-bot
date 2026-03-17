@@ -267,6 +267,26 @@ class GridBacktestAdapter:
         self._strict_spend_pct: bool = str(
             os.getenv("RUN_DEMO_GRID_STRICT_SPEND_PCT", "1")
         ).strip().lower() in {"1", "true", "yes", "on"}
+        # Cap total base exposure for percent-based sizing. Default behavior keeps
+        # base exposure bounded near `spend_pct_of_quote * grid_n_buy` of contributed
+        # capital unless explicitly overridden via env.
+        max_base_value_frac_raw = str(
+            os.getenv("RUN_DEMO_GRID_MAX_BASE_VALUE_FRAC", "")
+        ).strip()
+        if max_base_value_frac_raw:
+            self.max_base_value_frac = _d(max_base_value_frac_raw)
+        elif self.spend_pct_of_quote is not None and self.grid_n_buy > 0:
+            auto_frac = self.spend_pct_of_quote * Decimal(self.grid_n_buy)
+            self.max_base_value_frac = (
+                auto_frac if auto_frac <= Decimal("1") else Decimal("1")
+            )
+        else:
+            self.max_base_value_frac = Decimal("0")
+        if self.max_base_value_frac < 0 or self.max_base_value_frac > 1:
+            raise ValueError(
+                "RUN_DEMO_GRID_MAX_BASE_VALUE_FRAC must be in [0,1], "
+                f"got {self.max_base_value_frac}"
+            )
 
         # Diagnostics
         self.fills_buy = 0
@@ -909,6 +929,10 @@ class GridBacktestAdapter:
             "base": base_qty,
             "base_notional": base_notional,
             "equity": equity,
+            "max_base_value_frac": _d(getattr(self, "max_base_value_frac", Decimal("0"))),
+            "max_base_value_quote_cap": self._max_base_value_cap_quote(broker),
+            "base_exposure_quote": self._base_exposure_quote(broker),
+            "remaining_base_capacity_quote": self._remaining_base_capacity_quote(broker),
             "manual_deposits_total": self.manual_deposits_total,
             "core_initial_quote": _d(getattr(self._core.state, "initial_quote", Decimal("0"))),
             "core_deposits_total": _d(getattr(self._core.state, "deposits_total", Decimal("0"))),
@@ -2267,6 +2291,15 @@ class GridBacktestAdapter:
         if max_spend_net_placeable <= 0:
             return Decimal("0")
 
+        remaining_base_capacity = self._remaining_base_capacity_quote(broker)
+        if remaining_base_capacity is not None:
+            if remaining_base_capacity <= 0:
+                return Decimal("0")
+            if max_spend_net_placeable > remaining_base_capacity:
+                max_spend_net_placeable = remaining_base_capacity
+            if max_spend_net_placeable <= 0:
+                return Decimal("0")
+
         if self._strict_spend_pct:
             tol = target_spend_net * Decimal("0.000001")
             if tol < Decimal("0.00000001"):
@@ -2303,6 +2336,85 @@ class GridBacktestAdapter:
             return manual_basis
 
         return self._total_capital_in_quote(broker)
+
+    def _exposure_ref_price(self) -> Decimal:
+        for px in (self.last_bid, self.last_mid, self.last_ask):
+            if px is None:
+                continue
+            px_d = _d(px)
+            if px_d > 0:
+                return px_d
+        return Decimal("0")
+
+    def _reserved_quote_in_active_buy_orders(self, broker: Any = None) -> Decimal:
+        if broker is None or not hasattr(broker, "open_orders"):
+            return Decimal("0")
+
+        try:
+            total = Decimal("0")
+            for o in list(getattr(broker, "open_orders") or []):
+                if not self._order_is_active(o):
+                    continue
+                side = self._norm_side(_get(o, "side", default=None))
+                if side != "BUY":
+                    continue
+
+                px_raw = _get(o, "limit_price", "price", "limit", "px", default=None)
+                qty_raw = _get(o, "qty", "quantity", "origQty", "orig_qty", default=None)
+                if px_raw is None or qty_raw is None:
+                    continue
+
+                px = _d(px_raw)
+                qty = _d(qty_raw)
+                if px <= 0 or qty <= 0:
+                    continue
+                total += (px * qty)
+            return total
+        except Exception:
+            return Decimal("0")
+
+    def _max_base_value_cap_quote(self, broker: Any = None) -> Decimal:
+        if broker is None:
+            return Decimal("0")
+
+        frac = _d(getattr(self, "max_base_value_frac", Decimal("0")))
+        if frac <= 0:
+            return Decimal("0")
+
+        basis_quote = self._spend_capital_basis_in_quote(broker)
+        if basis_quote <= 0:
+            return Decimal("0")
+
+        cap_quote = basis_quote * frac
+        return cap_quote if cap_quote > 0 else Decimal("0")
+
+    def _base_exposure_quote(self, broker: Any = None) -> Decimal:
+        if broker is None:
+            return Decimal("0")
+
+        ref_px = self._exposure_ref_price()
+        if ref_px <= 0:
+            return Decimal("0")
+
+        try:
+            base_total = _d(self._broker_base_total(broker))
+        except Exception:
+            base_total = Decimal("0")
+        if base_total < 0:
+            base_total = Decimal("0")
+
+        exposure_quote = base_total * ref_px
+        exposure_quote += self._reserved_quote_in_active_buy_orders(broker)
+        return exposure_quote if exposure_quote > 0 else Decimal("0")
+
+    def _remaining_base_capacity_quote(self, broker: Any = None) -> Optional[Decimal]:
+        cap_quote = self._max_base_value_cap_quote(broker)
+        if cap_quote <= 0:
+            return None
+
+        exposure_quote = self._base_exposure_quote(broker)
+        left_quote = cap_quote - exposure_quote
+        return left_quote if left_quote > 0 else Decimal("0")
 
     def _target_spend_quote_uncapped(self, broker: Any = None) -> Decimal:
         """Configured per-order spend before free-quote capping."""
@@ -2397,6 +2509,10 @@ class GridBacktestAdapter:
         spend_target = self._target_spend_quote_uncapped(broker)
 
         if spend_target <= 0:
+            return False
+
+        remaining_base_capacity = self._remaining_base_capacity_quote(broker)
+        if remaining_base_capacity is not None and remaining_base_capacity <= 0:
             return False
 
         available_quote = self._broker_quote_cash(broker)
