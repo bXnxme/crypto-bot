@@ -249,7 +249,7 @@ class GridBacktestAdapter:
         self._lot_recovery_cooldown_after_fill_seconds: int = 30
         # If an order is already closed on exchange but we only saw part of its trade fragments,
         # wait a short grace period for remaining fragments before forced accumulator finalization.
-        self._fill_accum_finalize_grace_seconds: int = 3
+        self._fill_accum_finalize_grace_seconds: int = 8
         # Guard against tiny BUY orders when free quote is temporarily stale/low.
         # Example: 0.20 means spend must be at least 20% of intended spend.
         try:
@@ -834,6 +834,7 @@ class GridBacktestAdapter:
                 fee_quote = _d(acc.get("fee_quote", 0))
                 fee_base = _d(acc.get("fee_base", 0))
                 ts = acc.get("ts")
+                last_seen_at = acc.get("last_seen_at")
 
                 if qty <= 0 or quote_sum <= 0:
                     self._fill_accum_by_order_ref.pop(order_ref, None)
@@ -845,19 +846,21 @@ class GridBacktestAdapter:
                 if planned_qty is not None and planned_qty > 0 and qty < (planned_qty - eps):
                     age_sec = None
                     try:
-                        acc_ts = ts if isinstance(ts, datetime) else None
+                        acc_ts = last_seen_at if isinstance(last_seen_at, datetime) else None
+                        if acc_ts is None:
+                            acc_ts = ts if isinstance(ts, datetime) else None
                         if acc_ts is not None:
                             acc_utc = acc_ts if acc_ts.tzinfo is not None else acc_ts.replace(tzinfo=timezone.utc)
                             age_sec = (now_ts - acc_utc).total_seconds()
                     except Exception:
                         age_sec = None
 
-                    grace_sec = int(getattr(self, "_fill_accum_finalize_grace_seconds", 3))
+                    grace_sec = int(getattr(self, "_fill_accum_finalize_grace_seconds", 8))
                     if grace_sec > 0 and age_sec is not None and age_sec < grace_sec:
                         continue
                     force_finalize = True
                     logger.warning(
-                        "GRID_FILL finalize_from_acc_partial | order_ref={} side={} acc_qty={} planned_qty={} age_s={} reason=grace_expired",
+                        "GRID_FILL finalize_from_acc_partial | order_ref={} side={} acc_qty={} planned_qty={} age_s={} reason=grace_expired_after_last_seen",
                         order_ref_s,
                         side,
                         qty,
@@ -2226,6 +2229,7 @@ class GridBacktestAdapter:
         if qty <= 0 or px <= 0:
             return
         quote_sum = qty * px
+        seen_now = datetime.now(timezone.utc)
         cur = self._fill_accum_by_order_ref.get(order_ref)
         if cur is None:
             self._fill_accum_by_order_ref[order_ref] = {
@@ -2235,6 +2239,7 @@ class GridBacktestAdapter:
                 "fee_quote": fee_quote,
                 "fee_base": fee_base,
                 "ts": ts,
+                "last_seen_at": seen_now,
             }
             return
 
@@ -2247,6 +2252,7 @@ class GridBacktestAdapter:
                 "fee_quote": fee_quote,
                 "fee_base": fee_base,
                 "ts": ts,
+                "last_seen_at": seen_now,
             }
             return
 
@@ -2254,6 +2260,7 @@ class GridBacktestAdapter:
         cur["quote_sum"] = _d(cur.get("quote_sum", 0)) + quote_sum
         cur["fee_quote"] = _d(cur.get("fee_quote", 0)) + fee_quote
         cur["fee_base"] = _d(cur.get("fee_base", 0)) + fee_base
+        cur["last_seen_at"] = seen_now
         if cur.get("ts") is None and ts is not None:
             cur["ts"] = ts
 
