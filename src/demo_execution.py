@@ -862,6 +862,8 @@ class BinanceDemoExecution:
                 pass
 
             skipped_startup_trades = 0
+            buckets: dict[str, dict[str, Any]] = {}
+            bucket_order: list[str] = []
             for tr in trades:
                 if not isinstance(tr, dict):
                     continue
@@ -927,7 +929,56 @@ class BinanceDemoExecution:
                 except Exception:
                     client_oid = None
 
-                # Derive ORDER finality from (updated) cached order state.
+                bucket_key = oid_s or f"TRADE:{trade_id}"
+                bucket = buckets.get(bucket_key)
+                if bucket is None:
+                    bucket = {
+                        "order_id": str(order_id if order_id is not None else trade_id),
+                        "client_order_id": str(client_oid).strip() if client_oid else None,
+                        "side": side,
+                        "qty": Decimal("0"),
+                        "quote_sum": Decimal("0"),
+                        "fee_quote": Decimal("0"),
+                        "fee_base": Decimal("0"),
+                        "maker": maker,
+                        "trade_ids": [],
+                        "trade_times": [],
+                        "commission_asset": commission_asset,
+                        "cached": cached,
+                    }
+                    buckets[bucket_key] = bucket
+                    bucket_order.append(bucket_key)
+
+                bucket["qty"] = self._d(bucket.get("qty", "0")) + qty
+                bucket["quote_sum"] = self._d(bucket.get("quote_sum", "0")) + (qty * price)
+                bucket["fee_quote"] = self._d(bucket.get("fee_quote", "0")) + fee_quote
+                bucket["fee_base"] = self._d(bucket.get("fee_base", "0")) + fee_base
+                bucket["maker"] = bool(bucket.get("maker", False)) and maker
+                bucket["cached"] = self._order_state_cache.get(oid_s) if oid_s else cached
+                if not bucket.get("client_order_id") and client_oid:
+                    bucket["client_order_id"] = str(client_oid).strip()
+                if not bucket.get("commission_asset") and commission_asset:
+                    bucket["commission_asset"] = commission_asset
+                if trade_id is not None:
+                    bucket["trade_ids"].append(str(trade_id))
+                if tr.get("time") is not None:
+                    bucket["trade_times"].append(tr.get("time"))
+            if self._prime_trade_history_on_first_poll:
+                # после первого прохода просто "прогрели" seen keys
+                self._prime_trade_history_on_first_poll = False
+                return []
+
+            for bucket_key in bucket_order:
+                bucket = buckets[bucket_key]
+                qty_total = self._d(bucket.get("qty", "0"))
+                quote_sum = self._d(bucket.get("quote_sum", "0"))
+                if qty_total <= 0 or quote_sum <= 0:
+                    continue
+
+                cached = bucket.get("cached")
+
+                # Derive ORDER finality from the latest cache after all trades for this order
+                # were merged into one bucket for the current poll cycle.
                 status_fill: Any = "?"
                 partial_flag: Optional[bool] = None
                 try:
@@ -944,23 +995,36 @@ class BinanceDemoExecution:
                     status_fill = "?"
                     partial_flag = None
 
+                trade_ids = [x for x in (bucket.get("trade_ids") or []) if x]
+                if len(trade_ids) == 1:
+                    trade_ref = trade_ids[0]
+                elif trade_ids:
+                    trade_ref = f"{trade_ids[0]}:{trade_ids[-1]}:{len(trade_ids)}"
+                else:
+                    trade_ref = None
+
                 fill_obj = DemoFill(
-                    order_id=str(order_id if order_id is not None else trade_id),
-                    client_order_id=str(client_oid).strip() if client_oid else None,
+                    order_id=str(bucket.get("order_id") or ""),
+                    client_order_id=bucket.get("client_order_id"),
                     symbol=self.symbol,
-                    side=side,
-                    qty=qty,
-                    price=price,
-                    fee_quote=fee_quote,
-                    maker=maker,
-                    trade_id=(str(trade_id) if trade_id is not None else None),
+                    side=str(bucket.get("side") or ""),
+                    qty=qty_total,
+                    price=(quote_sum / qty_total) if qty_total > 0 else Decimal("0"),
+                    fee_quote=self._d(bucket.get("fee_quote", "0")),
+                    maker=bool(bucket.get("maker", False)),
+                    trade_id=trade_ref,
                 )
 
                 try:
+                    commission_asset = bucket.get("commission_asset")
                     if commission_asset:
                         setattr(fill_obj, "commission_asset", commission_asset)
-                    if fee_base > 0:
-                        setattr(fill_obj, "fee_base", fee_base)
+                    fee_base_total = self._d(bucket.get("fee_base", "0"))
+                    if fee_base_total > 0:
+                        setattr(fill_obj, "fee_base", fee_base_total)
+                    trade_times = bucket.get("trade_times") or []
+                    if trade_times:
+                        setattr(fill_obj, "ts", datetime.fromtimestamp(int(trade_times[-1]) / 1000, tz=timezone.utc))
                 except Exception:
                     pass
 
@@ -975,10 +1039,6 @@ class BinanceDemoExecution:
                     pass
 
                 out.append(fill_obj)
-            if self._prime_trade_history_on_first_poll:
-                # после первого прохода просто "прогрели" seen keys
-                self._prime_trade_history_on_first_poll = False
-                return []
 
             # если здесь оказались — значит уже не prime, возвращаем новые fills
             return out
@@ -1147,7 +1207,8 @@ class BinanceDemoExecution:
         # Hard execution-layer dedupe: if the same side/qty/price is already pending/open,
         # return the existing local placeholder instead of submitting another order.
         sig = self._make_order_sig(side_s, qty_d, px_d)
-        if sig in self._pending_submit_sigs:
+        exact_sig_dedupe_enabled = side_s != "SELL"
+        if exact_sig_dedupe_enabled and sig in self._pending_submit_sigs:
             for o in self.open_orders:
                 try:
                     if isinstance(o, dict):
@@ -1197,20 +1258,21 @@ class BinanceDemoExecution:
             )
 
         # Also guard against already-confirmed broker open order duplicates.
-        for o in self.open_orders:
-            try:
-                if isinstance(o, dict):
-                    o_side = str(o.get("side", "")).upper()
-                    o_qty = self._d(o.get("origQty", o.get("orig_qty", o.get("qty", "0"))))
-                    o_px = self._d(o.get("price", "0"))
-                else:
-                    o_side = self._norm_side(getattr(o, "side", ""))
-                    o_qty = self._d(getattr(o, "qty", "0"))
-                    o_px = self._d(getattr(o, "limit_price", "0"))
-                if self._make_order_sig(o_side, o_qty, o_px) == sig:
-                    return o
-            except Exception:
-                continue
+        if exact_sig_dedupe_enabled:
+            for o in self.open_orders:
+                try:
+                    if isinstance(o, dict):
+                        o_side = str(o.get("side", "")).upper()
+                        o_qty = self._d(o.get("origQty", o.get("orig_qty", o.get("qty", "0"))))
+                        o_px = self._d(o.get("price", "0"))
+                    else:
+                        o_side = self._norm_side(getattr(o, "side", ""))
+                        o_qty = self._d(getattr(o, "qty", "0"))
+                        o_px = self._d(getattr(o, "limit_price", "0"))
+                    if self._make_order_sig(o_side, o_qty, o_px) == sig:
+                        return o
+                except Exception:
+                    continue
 
         local_id = self._next_local_order_id()
         order = self._append_local_open_order(order_id=local_id, side=side_s, qty=qty_d, limit_price=px_d)

@@ -1428,33 +1428,78 @@ class GridBacktestAdapter:
                     self._sell_replace_cooldown_until_by_key.pop(target_key, None)
                 continue
 
-            layout_in_progress = False
+            matched_existing_subset = False
+            missing_targets: list[tuple[str, Decimal, Decimal]] = []
             if existing and not exact_layout:
-                unmatched_target_qtys = list(target_qtys_sorted)
-                matched_existing = True
+                remaining_targets = sorted(targets, key=lambda item: item[2])
+                matched_existing_subset = True
                 for existing_qty in existing_qtys:
                     match_idx: Optional[int] = None
-                    for idx, target_qty in enumerate(unmatched_target_qtys):
+                    for idx, (_, _, target_qty) in enumerate(remaining_targets):
                         if abs(existing_qty - target_qty) <= eps:
                             match_idx = idx
                             break
                     if match_idx is None:
-                        matched_existing = False
+                        matched_existing_subset = False
                         break
-                    unmatched_target_qtys.pop(match_idx)
+                    matched_target = remaining_targets.pop(match_idx)
+                    matched_sig = self._order_sig("SELL", matched_target[2], sell_px_place)
+                    if broker_open_sig_counts.get(matched_sig, 0) > 0:
+                        broker_open_sig_counts[matched_sig] = int(broker_open_sig_counts.get(matched_sig, 0)) - 1
+                if matched_existing_subset:
+                    missing_targets = remaining_targets
 
-                if matched_existing:
-                    pending_coverage = sum(
-                        1 for target_key, _, _ in targets
-                        if target_key in self.pending_sell_levels
-                    )
-                    if len(existing_qtys) + pending_coverage >= len(targets):
-                        layout_in_progress = True
-
-            if existing and layout_in_progress:
-                for target_key, _, _ in targets:
-                    if target_key in self.pending_sell_levels:
+            if existing and matched_existing_subset and missing_targets:
+                missing_total_qty = sum((qty for _, _, qty in missing_targets), Decimal("0"))
+                free_now = _free_base_for_new_sells()
+                if free_now + eps < missing_total_qty:
+                    for target_key, _, _ in missing_targets:
+                        self.pending_sell_levels[target_key] = sell_px_place
                         self._pending_sell_seen_at[target_key] = sync_now_ts
+                    continue
+
+                for target_key, _, sell_qty in missing_targets:
+                    if sell_qty <= 0:
+                        continue
+                    if sell_qty < self.min_qty:
+                        self.min_notional_blocked += 1
+                        continue
+                    if (sell_qty * sell_px_place) < self.min_notional:
+                        self.min_notional_blocked += 1
+                        continue
+
+                    if target_key in self.pending_sell_levels:
+                        self.duplicate_pending_skips += 1
+                        self.duplicate_place_skips += 1
+                        continue
+
+                    logger.trace(
+                        "GRID_PLACE try | side=SELL px={} qty={} notional={} key={} reason=fanout_missing_same_price",
+                        sell_px_place,
+                        sell_qty,
+                        (sell_qty * sell_px_place),
+                        target_key,
+                    )
+                    ok = self._place_limit_safe(broker, side="SELL", qty=sell_qty, limit_price=sell_px_place)
+                    logger.trace(
+                        "GRID_PLACE result | side=SELL px={} qty={} ok={} reason=fanout_missing_same_price",
+                        sell_px_place,
+                        sell_qty,
+                        ok,
+                    )
+                    if ok:
+                        self.pending_sell_levels[target_key] = sell_px_place
+                        self._pending_sell_seen_at[target_key] = sync_now_ts
+                        self._sell_replace_cooldown_until_by_key.pop(target_key, None)
+                        self._refresh_broker_state_after_fill(broker)
+                    else:
+                        logger.warning(
+                            "GRID_PLACE failed | side=SELL px={} qty={} free_base={} err={} reason=fanout_missing_same_price",
+                            sell_px_place,
+                            sell_qty,
+                            self._broker_base_qty(broker),
+                            self._last_place_limit_error,
+                        )
                 continue
 
             if existing and not exact_layout:
@@ -3700,6 +3745,7 @@ class GridBacktestAdapter:
             "manual_deposits_total": str(self.manual_deposits_total),
             "core_initial_quote": str(_d(getattr(self._core.state, "initial_quote", Decimal("0")))),
             "core_deposits_total": str(_d(getattr(self._core.state, "deposits_total", Decimal("0")))),
+            "core_seq": int(getattr(self._core.state, "seq", 0)),
             "last_quote_ts": self.last_quote_ts.isoformat() if self.last_quote_ts is not None else None,
             "last_bar_close": str(self.last_bar_close) if self.last_bar_close is not None else None,
             "last_bar_ts": self.last_bar_ts.isoformat() if self.last_bar_ts is not None else None,
@@ -3759,6 +3805,13 @@ class GridBacktestAdapter:
                     open_seq=l.open_seq,
                 )
             )
+        try:
+            self._core.state.seq = max(
+                int(state.get("core_seq", 0) or 0),
+                max((int(getattr(l, "open_seq", 0) or 0) for l in self.open_lots), default=0),
+            )
+        except Exception:
+            self._core.state.seq = max((int(getattr(l, "open_seq", 0) or 0) for l in self.open_lots), default=0)
 
         self.pending_buy_levels = {
             str(k): _d(v) for k, v in (state.get("pending_buy_levels") or {}).items()
